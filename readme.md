@@ -1,10 +1,10 @@
-# YouTrans
+# yttrans
 
 [![Made with Delphi](https://img.shields.io/badge/Made%20with-Delphi-blue?style=flat-square&logo=delphi)](https://www.embarcadero.com/products/delphi)
 
 A simple, fast command-line tool for downloading YouTube video transcripts.
 
-YouTrans acts as a lightweight wrapper around the powerful `yt-dlp` engine, focusing on one task: fetching the plain text of a video's subtitles without downloading the video itself.
+yttrans acts as a lightweight wrapper around the powerful `yt-dlp` engine, focusing on one task: fetching the plain text of a video's subtitles without downloading the video itself.
 
 ## Features
 
@@ -16,16 +16,16 @@ YouTrans acts as a lightweight wrapper around the powerful `yt-dlp` engine, focu
 
 ## Requirements
 
-YouTrans requires **`yt-dlp.exe`** to function.
+yttrans requires **`yt-dlp.exe`** to function.
 
 *   You must download `yt-dlp.exe` from the official [yt-dlp GitHub Releases page](https://github.com/yt-dlp/yt-dlp/releases/latest).
-*   Place `yt-dlp.exe` in the **same directory** as `youtrans.exe`.
+*   Place `yt-dlp.exe` in the **same directory** as `yttrans.exe`.
 
 ## Installation
 
-1.  Download the latest `youtrans.exe` from the [Releases](https://github.com/your-username/your-repo/releases) page of this repository.
+1.  Download the latest `yttrans.exe` from the [Releases](https://github.com/your-username/your-repo/releases) page of this repository.
 2.  Download `yt-dlp.exe` from its [official repository](https://github.com/yt-dlp/yt-dlp/releases/latest).
-3.  Place both `youtrans.exe` and `yt-dlp.exe` in the same folder.
+3.  Place both `yttrans.exe` and `yt-dlp.exe` in the same folder.
 4.  (Optional) For easy access from anywhere, add this folder to your system's `PATH` environment variable.
 
 ## Usage
@@ -33,7 +33,7 @@ YouTrans requires **`yt-dlp.exe`** to function.
 The basic command structure is:
 
 ```bash
-youtrans <URL> [options]
+yttrans <URL> [options]
 ```
 
 ### Examples
@@ -41,26 +41,26 @@ youtrans <URL> [options]
 **1. Get a transcript in English and print it to the console:**
 
 ```bash
-youtrans "https://www.youtube.com/watch?v=dQw4w9WgXcQ" -l en
+yttrans "https://www.youtube.com/watch?v=dQw4w9WgXcQ" -l en
 ```
 
 **2. Get a transcript in Polish and save it to a file:**
 
 ```bash
-youtrans "https://www.youtube.com/watch?v=some_video_id" -l pl -o "C:\Transcripts\MyTranscript.txt"
+yttrans "https://www.youtube.com/watch?v=some_video_id" -l pl -o "C:\Transcripts\MyTranscript.txt"
 ```
 
 **3. Get the default English transcript and save it to a file in the current directory:**
 *(The `-l` flag defaults to `en` if omitted)*
 
 ```bash
-youtrans "https://www.youtube.com/watch?v=another_video_id" -o transcript.txt
+yttrans "https://www.youtube.com/watch?v=another_video_id" -o transcript.txt
 ```
 
 **4. Display the help message:**
 
 ```bash
-youtrans -h
+yttrans -h
 ```
 
 ### Command-Line Arguments & Options
