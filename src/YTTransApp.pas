@@ -42,7 +42,7 @@ function Run: Integer;
 implementation
 
 uses
-  System.IOUtils, System.JSON, System.StrUtils, System.DateUtils, autoFree, MaxLogic.ioUtils;
+  System.IOUtils, System.IniFiles, System.JSON, System.StrUtils, System.DateUtils, autoFree, MaxLogic.ioUtils;
 
 resourcestring
   RSUsage =
@@ -60,6 +60,137 @@ resourcestring
     '  -h, --help              Show this help and exit.' + sLineBreak;
 
   RSError = 'Error: %s';
+
+const
+  CSettingsFileName = 'settings.ini';
+  CAutoUpdateSection = 'auto-update';
+  CEnabledKey = 'enabled';
+  CLastCheckKey = 'last-check';
+  CIntervalKey = 'interval-in-days';
+
+function GetSettingsPath: string;
+begin
+  Result := TPath.Combine(ExtractFilePath(ParamStr(0)), CSettingsFileName);
+end;
+
+function GetYtDlpPath: string;
+begin
+  Result := TPath.Combine(ExtractFilePath(ParamStr(0)), 'yt-dlp.exe');
+end;
+
+procedure EnsureDefaultSettingsFile(const aSettingsPath: string);
+var
+  lLines: TStringList;
+begin
+  if TFile.Exists(aSettingsPath) then
+    Exit;
+
+  lLines := TStringList.Create;
+  try
+    lLines.Add('[auto-update]');
+    lLines.Add('enabled=1');
+    lLines.Add('last-check=');
+    lLines.Add('interval-in-days=7');
+    lLines.SaveToFile(aSettingsPath, TEncoding.UTF8);
+  finally
+    lLines.Free;
+  end;
+end;
+
+function ReadEnabled(const aIni: TIniFile): Boolean;
+var
+  lRaw: string;
+begin
+  lRaw := Trim(aIni.ReadString(CAutoUpdateSection, CEnabledKey, '1'));
+  Result := (lRaw = '1') or SameText(lRaw, 'true') or SameText(lRaw, 'yes');
+end;
+
+function TryParseLastCheck(const aValue: string; out aDate: TDateTime): Boolean;
+var
+  lYear: Integer;
+  lMonth: Integer;
+  lDay: Integer;
+begin
+  Result := False;
+  if aValue.Trim.IsEmpty then
+    Exit;
+
+  Result := TryISO8601ToDate(aValue, aDate, True);
+  if Result then
+  begin
+    aDate := DateOf(aDate);
+    Exit;
+  end;
+
+  if (Length(aValue) = 10) and (aValue[5] = '-') and (aValue[8] = '-') and
+     TryStrToInt(Copy(aValue, 1, 4), lYear) and
+     TryStrToInt(Copy(aValue, 6, 2), lMonth) and
+     TryStrToInt(Copy(aValue, 9, 2), lDay) then
+    Result := TryEncodeDate(Word(lYear), Word(lMonth), Word(lDay), aDate);
+end;
+
+procedure UpdateLastCheck(const aSettingsPath: string; const aDate: TDateTime);
+var
+  lIni: TIniFile;
+begin
+  lIni := TIniFile.Create(aSettingsPath);
+  try
+    lIni.WriteString(CAutoUpdateSection, CLastCheckKey, FormatDateTime('yyyy-mm-dd', DateOf(aDate)));
+  finally
+    lIni.Free;
+  end;
+end;
+
+procedure TryAutoUpdateYtDlp;
+var
+  lSettingsPath: string;
+  lYtDlpPath: string;
+  lIni: TIniFile;
+  lEnabled: Boolean;
+  lIntervalInDays: Integer;
+  lLastCheckRaw: string;
+  lLastCheck: TDateTime;
+  lShouldCheck: Boolean;
+begin
+  lSettingsPath := GetSettingsPath;
+  EnsureDefaultSettingsFile(lSettingsPath);
+
+  lIni := TIniFile.Create(lSettingsPath);
+  try
+    lEnabled := ReadEnabled(lIni);
+    lIntervalInDays := lIni.ReadInteger(CAutoUpdateSection, CIntervalKey, 7);
+    if lIntervalInDays < 1 then
+      lIntervalInDays := 1;
+    lLastCheckRaw := lIni.ReadString(CAutoUpdateSection, CLastCheckKey, '');
+  finally
+    lIni.Free;
+  end;
+
+  if not lEnabled then
+    Exit;
+
+  lShouldCheck := not TryParseLastCheck(lLastCheckRaw, lLastCheck);
+  if not lShouldCheck then
+    lShouldCheck := DaysBetween(Date, DateOf(lLastCheck)) >= lIntervalInDays;
+  if not lShouldCheck then
+    Exit;
+
+  lYtDlpPath := GetYtDlpPath;
+  if not TFile.Exists(lYtDlpPath) then
+  begin
+    UpdateLastCheck(lSettingsPath, Date);
+    Exit;
+  end;
+
+  try
+    MaxLogic.ioutils.ExecuteFile(lYtDlpPath, '-U', '', True, True);
+  except
+    on E: Exception do
+      WriteLn('Warning: yt-dlp auto-update failed: ', E.Message);
+  end;
+
+  UpdateLastCheck(lSettingsPath, Date);
+end;
 
 function BuildMetaSection(const aMeta: TTranscriptMetadata): string;
 var
@@ -99,6 +230,7 @@ var
 begin
   Result := 1; // Default to error
   try
+    TryAutoUpdateYtDlp;
     lConfig := ParseCommandLine;
 
     if lConfig.ShowHelp then
@@ -276,7 +408,7 @@ var
   lMetaContent: string;
 begin
   Result := Default(TTranscriptResult);
-  lYtDlpPath := TPath.Combine(ExtractFilePath(ParamStr(0)), 'yt-dlp.exe');
+  lYtDlpPath := GetYtDlpPath;
   if not TFile.Exists(lYtDlpPath) then
     raise EFileNotFoundException.CreateFmt('Required executable not found: %s', [lYtDlpPath]);
 

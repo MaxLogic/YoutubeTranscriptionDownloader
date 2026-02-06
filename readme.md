@@ -20,6 +20,25 @@ yttrans requires **`yt-dlp.exe`** to function.
 
 *   You must download `yt-dlp.exe` from the official [yt-dlp GitHub Releases page](https://github.com/yt-dlp/yt-dlp/releases/latest).
 *   Place `yt-dlp.exe` in the **same directory** as `yttrans.exe`.
+*   `settings.ini` can be placed in the same directory as `yttrans.exe` to control `yt-dlp` auto-update checks.
+
+### Auto-Update Settings
+
+At startup, yttrans checks `settings.ini` (next to `yttrans.exe`) and can run `yt-dlp -U` automatically when due.
+
+Default file:
+
+```ini
+[auto-update]
+enabled=1
+last-check=
+interval-in-days=7
+```
+
+Rules:
+*   `enabled=1` enables checks (`0` disables).
+*   `last-check` stores the last check date (`yyyy-mm-dd`).
+*   If `last-check` is empty or older than `interval-in-days`, yttrans tries an update and then refreshes `last-check`.
 
 ## Installation
 
