@@ -65,10 +65,13 @@ yttrans -h
 
 ### Command-Line Arguments & Options
 
+Use `yttrans` for these options. `-meta` is not a `yt-dlp` flag.
+
 | Argument / Option | Alias        | Description                                                                                             |
 | ----------------- | ------------ | ------------------------------------------------------------------------------------------------------- |
 | `<URL>`           |              | The full URL of the YouTube video. This is a **required** argument.                                     |
 | `-l`, `--lang`    |              | The language code for the subtitles (e.g., `en`, `pl`). Defaults to `en` if not specified.                |
 | `-o`, `--output`  |              | The full path for the output text file. If omitted, the transcript is printed to the standard output (console). |
+| `-meta`, `--meta` |              | Prepends metadata before transcript text: `url`, `title`, `channel`, and `created`.                    |
 | `-h`, `--help`    |              | Displays the help message and exits.                                                                    |
 
