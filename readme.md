@@ -20,7 +20,7 @@ yttrans requires **`yt-dlp.exe`** to function.
 
 *   You must download `yt-dlp.exe` from the official [yt-dlp GitHub Releases page](https://github.com/yt-dlp/yt-dlp/releases/latest).
 *   Place `yt-dlp.exe` in the **same directory** as `yttrans.exe`.
-*   `settings.ini` can be placed in the same directory as `yttrans.exe` to control `yt-dlp` auto-update checks.
+*   `settings.ini` can be placed in the same directory as `yttrans.exe` to control auto-update and default app options.
 
 ### Auto-Update Settings
 
@@ -33,12 +33,39 @@ Default file:
 enabled=1
 last-check=
 interval-in-days=7
+
+[default]
+meta=true
+output_dir=output\
+prefix_separator= - 
+
+[meta]
+url=true
+title=true
+channel=true
+created=true
+keywords=true
+video_id=true
+uploader=true
+uploader_id=true
+channel_id=true
+duration=true
+view_count=true
+like_count=true
+comment_count=true
+tags=true
+description=false
 ```
 
 Rules:
 *   `enabled=1` enables checks (`0` disables).
 *   `last-check` stores the last check date (`yyyy-mm-dd`).
 *   If `last-check` is empty or older than `interval-in-days`, yttrans tries an update and then refreshes `last-check`.
+*   `default.meta` enables metadata by default. True values include: `true`, `t`, `yes`, `y`, `on`, `enabled`, `1`.
+*   `default.output_dir` can be relative (to `yttrans.exe`) or absolute. When used, transcript file name is auto-generated from the YouTube title with `.md` extension.
+*   `default.prefix_separator` controls how `-p/--prefix` is glued to auto-generated title file names.
+*   `[meta]` allows enabling/disabling each metadata line independently.
+*   Auto-generated output files never overwrite existing files (`name.md`, `name (2).md`, ...).
 
 ## Installation
 
@@ -76,7 +103,25 @@ yttrans "https://www.youtube.com/watch?v=some_video_id" -l pl -o "C:\Transcripts
 yttrans "https://www.youtube.com/watch?v=another_video_id" -o transcript.txt
 ```
 
-**4. Display the help message:**
+**4. Save to a directory and auto-name the file from video title:**
+
+```bash
+yttrans "https://www.youtube.com/watch?v=another_video_id" -o "C:\Transcripts\"
+```
+
+**5. Add a filename prefix for auto-generated names:**
+
+```bash
+yttrans "https://www.youtube.com/watch?v=another_video_id" -o "C:\Transcripts\" -p "AI Related"
+```
+
+**6. Include metadata keywords (auto-enables meta):**
+
+```bash
+yttrans "https://www.youtube.com/watch?v=another_video_id" -keywords "delphi, subtitles, tutorial"
+```
+
+**7. Display the help message:**
 
 ```bash
 yttrans -h
@@ -90,7 +135,9 @@ Use `yttrans` for these options. `-meta` is not a `yt-dlp` flag.
 | ----------------- | ------------ | ------------------------------------------------------------------------------------------------------- |
 | `<URL>`           |              | The full URL of the YouTube video. This is a **required** argument.                                     |
 | `-l`, `--lang`    |              | The language code for the subtitles (e.g., `en`, `pl`). Defaults to `en` if not specified.                |
-| `-o`, `--output`  |              | The full path for the output text file. If omitted, the transcript is printed to the standard output (console). |
-| `-meta`, `--meta` |              | Prepends metadata before transcript text: `url`, `title`, `channel`, and `created`.                    |
+| `-o`, `--output`  |              | Output file path. If a directory path is given, yttrans uses sanitized title as `<title>.md` and avoids overwrite by adding suffix. |
+| `-p`, `--prefix`  |              | Prefix for auto-generated file names. Separator comes from `settings.ini` key `default.prefix_separator`. |
+| `-meta`, `--meta` |              | Prepends metadata before transcript text. Individual fields are controlled by `[meta]` switches in `settings.ini`. |
+| `-keywords`       |              | Comma-separated keywords added to metadata section. Automatically enables `-meta`.                      |
 | `-h`, `--help`    |              | Displays the help message and exits.                                                                    |
 
