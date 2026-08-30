@@ -12,6 +12,7 @@ yttrans acts as a lightweight wrapper around the powerful `yt-dlp` engine, focus
 *   **Language Selection:** Specify the desired transcript language (e.g., `en`, `pl`, `de`).
 *   **Flexible Output:** Print the transcript directly to the console or save it to a text file.
 *   **Channel Mode:** Start from one video URL and download transcripts for the whole channel.
+*   **YAML Download Queue (planned):** Process grouped channels and videos as one throttled job while retaining failures for later runs.
 *   **Authenticated Access:** Optional cookie-based authentication for YouTube requests.
 *   **Parallel Processing:** Channel mode supports worker parallelism (`-j`) with retry/backoff on transient failures.
 *   **Clean Text:** Automatically parses the SRT subtitle format into clean, readable plain text.
@@ -162,6 +163,46 @@ yttrans "https://www.youtube.com/watch?v=VIDEO_ID" -c --cookies-from-browser chr
 ```bash
 yttrans "https://www.youtube.com/watch?v=VIDEO_ID" -c --retry-unavailable
 ```
+
+### YAML Download File Mode (planned)
+
+The accepted file-mode design replaces a list of separate batch commands with one coordinated queue:
+
+```bash
+yttrans --file download.yaml
+```
+
+Copy [`download.sample.yaml`](download.sample.yaml) to the ignored local `download.yaml`, then edit its groups. A group can set one `subfolder` for every channel and standalone video below it:
+
+```yaml
+schema: 1
+mode: fresh
+
+defaults:
+  language: en
+  output_dir: output
+  jobs: 1
+
+groups:
+  - name: MaxLogic examples
+    subfolder: MaxLogic
+    channels:
+      - url: https://www.youtube.com/@MaxLogicPawel
+    videos:
+      - url: https://www.youtube.com/watch?v=lRQae-tRw-k
+```
+
+Relative `output_dir` values resolve from the YAML file directory. Standalone videos in the example write below `output/MaxLogic/`; channel videos write below `output/MaxLogic/<channel-name>/`.
+
+The top-level modes are:
+
+*   `fresh`: process new standalone entries and rescan healthy channels, while skipping entries and channel videos that failed previously.
+*   `failed`: retry retained failed entries and cached failures discovered within channels.
+*   `all`: process all enabled entries and retry cached channel failures.
+
+Successfully downloaded standalone video entries are removed from the YAML file. Channel entries remain so later runs can discover new uploads. Failures retain their error category, message, attempt timestamp, and available YouTube metadata. One shared throttle controller applies across the complete file.
+
+File mode is specified in [`docs/specs/2026-08-30-yaml-download-file-mode-spec.md`](docs/specs/2026-08-30-yaml-download-file-mode-spec.md). The current executable does not support `--file` until that implementation is completed.
 
 ### Command-Line Arguments & Options
 

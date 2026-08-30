@@ -1,0 +1,3 @@
+[submodule "third_party/VSoft.YAML"]
+	path = third_party/VSoft.YAML
+	url = https://github.com/VSoftTechnologies/VSoft.YAML.git

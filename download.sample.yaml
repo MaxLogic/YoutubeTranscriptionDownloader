@@ -1,0 +1,28 @@
+# Copy this file to download.yaml, then edit the queue.
+schema: 1
+mode: fresh # fresh, failed, or all
+
+defaults:
+  language: en
+  output_dir: output
+  jobs: 1
+  delay_jitter_ms: 1200
+
+groups:
+  # The subfolder applies to every channel and video in this group.
+  - name: MaxLogic examples
+    subfolder: MaxLogic
+    channels:
+      - name: MaxLogic
+        url: https://www.youtube.com/@MaxLogicPawel
+    videos:
+      - name: Example MaxLogic video
+        url: https://www.youtube.com/watch?v=lRQae-tRw-k
+
+  # A group without subfolder writes directly below defaults.output_dir.
+  - name: Root output example
+    enabled: false
+    videos:
+      - url: https://www.youtube.com/watch?v=lRQae-tRw-k
+        notes: Individual entries may be disabled or given their own subfolder.
+        enabled: false
