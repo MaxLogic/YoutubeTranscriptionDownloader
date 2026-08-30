@@ -10,7 +10,7 @@ uses
 type
   EDownloadFileError = class(Exception);
 
-  TDownloadMode = (dmFresh, dmFailed, dmAll);
+  TDownloadMode = (dmFresh, dmFailed, dmThrottled, dmAll);
   TDownloadEntryKind = (dekChannel, dekVideo);
 
   TDownloadOptions = record
@@ -18,7 +18,11 @@ type
     OutputDir: string;
     Subfolder: string;
     Jobs: Integer;
+    RequestIntervalMs: Integer;
     DelayJitterMs: Integer;
+    SleepRequestsSeconds: Integer;
+    SleepSubtitlesSeconds: Integer;
+    SocketTimeoutSeconds: Integer;
     IncludeShorts: Boolean;
     IncludeLive: Boolean;
     OverwriteExisting: Boolean;
@@ -64,6 +68,7 @@ type
     destructor Destroy; override;
     function Entries: TArray<TDownloadEntry>;
     function IsEligible(const aEntry: TDownloadEntry): Boolean;
+    function ThrottleCooldownRemainingMs(const aNowUtc: TDateTime): Int64;
     procedure RemoveStandaloneVideo(const aGroupIndex, aVideoIndex: Integer);
     procedure RemoveStandaloneVideoByUrl(const aGroupIndex: Integer;
       const aUrl: string);
@@ -80,6 +85,7 @@ function DownloadModeToString(const aMode: TDownloadMode): string;
 implementation
 
 uses
+  System.DateUtils,
   System.Generics.Collections,
   System.Hash,
   System.IOUtils,
@@ -90,32 +96,40 @@ uses
 const
   CTopFields: array[0..4] of string =
     ('schema', 'mode', 'defaults', 'groups', 'state');
-  CDefaultFields: array[0..10] of string =
-    ('language', 'output_dir', 'jobs', 'delay_jitter_ms', 'include_shorts',
-     'include_live', 'overwrite_existing', 'metadata', 'keywords', 'cookies',
+  CDefaultFields: array[0..14] of string =
+    ('language', 'output_dir', 'jobs', 'request_interval_ms', 'delay_jitter_ms',
+     'sleep_requests_seconds', 'sleep_subtitles_seconds',
+     'socket_timeout_seconds', 'include_shorts', 'include_live',
+     'overwrite_existing', 'metadata', 'keywords', 'cookies',
      'cookies_from_browser');
-  CGroupFields: array[0..13] of string =
-    ('name', 'enabled', 'subfolder', 'language', 'jobs', 'delay_jitter_ms',
-     'include_shorts', 'include_live', 'overwrite_existing', 'metadata',
-     'keywords', 'channels', 'videos', 'notes');
-  CEntryFields: array[0..13] of string =
+  CGroupFields: array[0..17] of string =
+    ('name', 'enabled', 'subfolder', 'language', 'jobs', 'request_interval_ms',
+     'delay_jitter_ms', 'sleep_requests_seconds', 'sleep_subtitles_seconds',
+     'socket_timeout_seconds', 'include_shorts', 'include_live',
+     'overwrite_existing', 'metadata', 'keywords', 'channels', 'videos',
+     'notes');
+  CEntryFields: array[0..17] of string =
     ('url', 'name', 'enabled', 'subfolder', 'language', 'jobs',
-     'delay_jitter_ms', 'include_shorts', 'include_live',
-     'overwrite_existing', 'metadata', 'keywords', 'notes', 'state');
+     'request_interval_ms', 'delay_jitter_ms', 'sleep_requests_seconds',
+     'sleep_subtitles_seconds', 'socket_timeout_seconds', 'include_shorts',
+     'include_live', 'overwrite_existing', 'metadata', 'keywords', 'notes',
+     'state');
   CEntrySequences: array[0..1] of string = ('channels', 'videos');
-  CStateFields: array[0..23] of string =
+  CStateFields: array[0..24] of string =
     ('status', 'last_attempt_utc', 'attempt_count', 'video_id',
      'video_published_at', 'error_kind', 'error', 'last_success_utc',
      'channel_id', 'downloaded', 'skipped', 'unavailable',
      'unavailable_cached', 'failed', 'deferred', 'last_run_started_utc',
      'last_checkpoint_utc', 'last_run_completed_utc', 'processed',
-     'eligibility_skipped', 'overwritten', 'total', 'message', 'url');
+      'eligibility_skipped', 'overwritten', 'total', 'message', 'url',
+      'throttle_retry_after_utc');
 
 function DownloadModeToString(const aMode: TDownloadMode): string;
 begin
   case aMode of
     dmFresh: Result := 'fresh';
     dmFailed: Result := 'failed';
+    dmThrottled: Result := 'throttled';
     dmAll: Result := 'all';
   else
     Result := 'fresh';
@@ -278,10 +292,18 @@ end;
 
 class function TDownloadFile.ParseDocument(const aText: string): IYAMLDocument;
 var
+  lNormalizedText: string;
   lDocuments: TArray<IYAMLDocument>;
 begin
+  // Older yttrans versions emitted these empty runtime-state values as YAML
+  // nulls. VSoft.YAML currently stops a surrounding sequence after such a
+  // nested null, so normalize only the application-owned fields before parse.
+  // The next checkpoint rewrites them as quoted empty strings.
+  lNormalizedText := TRegEx.Replace(aText,
+    '^([ \t]+)(error_kind|error):[ \t]*(#.*)?$', '$1$2: ''''$3',
+    [roMultiLine]);
   try
-    lDocuments := TYAML.LoadAllFromString(aText);
+    lDocuments := TYAML.LoadAllFromString(lNormalizedText);
   except
     on E: Exception do
       raise EDownloadFileError.Create('Invalid YAML: ' + E.Message);
@@ -379,8 +401,9 @@ begin
   lMode := LowerCase(lValue.AsString);
   if lMode = 'fresh' then FMode := dmFresh
   else if lMode = 'failed' then FMode := dmFailed
+  else if lMode = 'throttled' then FMode := dmThrottled
   else if lMode = 'all' then FMode := dmAll
-  else raise EDownloadFileError.Create('mode must be fresh, failed, or all');
+  else raise EDownloadFileError.Create('mode must be fresh, failed, throttled, or all');
 
   if FRoot.TryGetValue('defaults', lValue) then
   begin
@@ -388,7 +411,11 @@ begin
     lDefaults := lValue.AsMapping;
     ValidateFields(lDefaults, 'defaults', CDefaultFields);
     MappingInt(lDefaults, 'jobs', 1, 1);
+    MappingInt(lDefaults, 'request_interval_ms', 3000, 0);
     MappingInt(lDefaults, 'delay_jitter_ms', 1200, 0);
+    MappingInt(lDefaults, 'sleep_requests_seconds', 1, 0);
+    MappingInt(lDefaults, 'sleep_subtitles_seconds', 3, 0);
+    MappingInt(lDefaults, 'socket_timeout_seconds', 60, 0);
     if lDefaults.ContainsKey('cookies') and lDefaults.ContainsKey('cookies_from_browser') and
        (Trim(lDefaults.S['cookies']) <> '') and (Trim(lDefaults.S['cookies_from_browser']) <> '') then
       raise EDownloadFileError.Create('defaults.cookies and defaults.cookies_from_browser are mutually exclusive');
@@ -411,7 +438,11 @@ begin
       lPath := Format('groups[%d]', [I]);
       ValidateFields(lGroup, lPath, CGroupFields);
       MappingInt(lGroup, 'jobs', 1, 1);
+      MappingInt(lGroup, 'request_interval_ms', 3000, 0);
       MappingInt(lGroup, 'delay_jitter_ms', 1200, 0);
+      MappingInt(lGroup, 'sleep_requests_seconds', 1, 0);
+      MappingInt(lGroup, 'sleep_subtitles_seconds', 3, 0);
+      MappingInt(lGroup, 'socket_timeout_seconds', 60, 0);
       for lKey in CEntrySequences do
         if lGroup.TryGetValue(lKey, lValue) then
         begin
@@ -431,7 +462,11 @@ begin
             if Trim(MappingString(lEntry, 'url', '')) = '' then
               raise EDownloadFileError.CreateFmt('%s.%s[%d].url is required', [lPath, lKey, J]);
             MappingInt(lEntry, 'jobs', 1, 1);
+            MappingInt(lEntry, 'request_interval_ms', 3000, 0);
             MappingInt(lEntry, 'delay_jitter_ms', 1200, 0);
+            MappingInt(lEntry, 'sleep_requests_seconds', 1, 0);
+            MappingInt(lEntry, 'sleep_subtitles_seconds', 3, 0);
+            MappingInt(lEntry, 'socket_timeout_seconds', 60, 0);
             if MappingBool(lGroup, 'enabled', True) and MappingBool(lEntry, 'enabled', True) then
             begin
               lPath := lKey + '|' + NormalizeQueueUrl(lEntry.S['url']);
@@ -461,7 +496,11 @@ begin
   Result := aBase;
   Result.Language := MappingString(aMapping, 'language', Result.Language);
   Result.Jobs := MappingInt(aMapping, 'jobs', Result.Jobs, 1);
+  Result.RequestIntervalMs := MappingInt(aMapping, 'request_interval_ms', Result.RequestIntervalMs, 0);
   Result.DelayJitterMs := MappingInt(aMapping, 'delay_jitter_ms', Result.DelayJitterMs, 0);
+  Result.SleepRequestsSeconds := MappingInt(aMapping, 'sleep_requests_seconds', Result.SleepRequestsSeconds, 0);
+  Result.SleepSubtitlesSeconds := MappingInt(aMapping, 'sleep_subtitles_seconds', Result.SleepSubtitlesSeconds, 0);
+  Result.SocketTimeoutSeconds := MappingInt(aMapping, 'socket_timeout_seconds', Result.SocketTimeoutSeconds, 0);
   Result.IncludeShorts := MappingBool(aMapping, 'include_shorts', Result.IncludeShorts);
   Result.IncludeLive := MappingBool(aMapping, 'include_live', Result.IncludeLive);
   Result.OverwriteExisting := MappingBool(aMapping, 'overwrite_existing', Result.OverwriteExisting);
@@ -490,7 +529,11 @@ begin
   lBase.Language := 'en';
   lBase.OutputDir := 'output';
   lBase.Jobs := 1;
+  lBase.RequestIntervalMs := 3000;
   lBase.DelayJitterMs := 1200;
+  lBase.SleepRequestsSeconds := 1;
+  lBase.SleepSubtitlesSeconds := 3;
+  lBase.SocketTimeoutSeconds := 60;
   lBase.Metadata := True;
   if FRoot.ContainsKey('defaults') then
   begin
@@ -567,11 +610,33 @@ begin
         Result := not lFailed;
     dmFailed:
       Result := lFailed;
+    dmThrottled:
+      Result := SameText(aEntry.StateStatus, 'throttled');
     dmAll:
       Result := True;
   else
     Result := False;
   end;
+end;
+
+function TDownloadFile.ThrottleCooldownRemainingMs(
+  const aNowUtc: TDateTime): Int64;
+var
+  lRetryAtUtc: TDateTime;
+  lState: IYAMLMapping;
+begin
+  Result := 0;
+  if not FRoot.ContainsKey('state') then
+    Exit;
+  lState := FRoot['state'].AsMapping;
+  if not lState.ContainsKey('throttle_retry_after_utc') then
+    Exit;
+  if not TryISO8601ToDate(
+    Trim(lState.S['throttle_retry_after_utc']), lRetryAtUtc, True) then
+    Exit;
+  if lRetryAtUtc <= aNowUtc then
+    Exit;
+  Result := MilliSecondsBetween(lRetryAtUtc, aNowUtc);
 end;
 
 procedure TDownloadFile.SetMode(const aValue: TDownloadMode);

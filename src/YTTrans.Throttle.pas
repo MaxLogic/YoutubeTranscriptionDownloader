@@ -10,15 +10,21 @@ type
   private
     FLock: TCriticalSection;
     FCooldownUntil: UInt64;
+    FNextRequestAt: UInt64;
     FConsecutiveThrottles: Integer;
     FEffectiveWorkers: Integer;
+    FMinRequestIntervalMs: Cardinal;
     FTerminal: Boolean;
     function DelayForAttempt(const aAttempt: Integer): Cardinal;
   public
-    constructor Create(const aConfiguredWorkers: Integer);
+    constructor Create(const aConfiguredWorkers: Integer;
+      const aMinRequestIntervalMs: Cardinal = 3000);
     destructor Destroy; override;
     procedure BeforeRequest;
     procedure ReportResult(const aExitCode: Integer; const aOutput: string);
+    procedure SetMinRequestInterval(const aValueMs: Cardinal);
+    function CooldownRemainingMs: Cardinal;
+    function ThrottleAttempt: Integer;
     function EffectiveWorkers: Integer;
     function IsTerminal: Boolean;
     class function IsThrottleMessage(const aMessage: string): Boolean; static;
@@ -32,15 +38,18 @@ uses
   System.Classes;
 
 const
-  CThrottleDelays: array[1..3] of Cardinal = (30000, 120000, 300000);
+  CThrottleDelays: array[1..2] of Cardinal = (120000, 600000);
+  CTerminalThrottleAttempt = 3;
 
-constructor TThrottleController.Create(const aConfiguredWorkers: Integer);
+constructor TThrottleController.Create(const aConfiguredWorkers: Integer;
+  const aMinRequestIntervalMs: Cardinal);
 begin
   inherited Create;
   FLock := TCriticalSection.Create;
   FEffectiveWorkers := aConfiguredWorkers;
   if FEffectiveWorkers < 1 then
     FEffectiveWorkers := 1;
+  FMinRequestIntervalMs := aMinRequestIntervalMs;
 end;
 
 destructor TThrottleController.Destroy;
@@ -69,6 +78,7 @@ begin
   lText := LowerCase(aMessage);
   Result := ContainsText(lText, 'http error 429') or
     ContainsText(lText, 'too many requests') or
+    ContainsText(lText, 'youtube throttling persisted') or
     ContainsText(lText, 'sign in to confirm you') or
     ContainsText(lText, 'not a bot') or
     ContainsText(lText, 'temporarily blocked') or
@@ -84,12 +94,17 @@ begin
     FLock.Enter;
     try
       lWaitUntil := FCooldownUntil;
+      if FNextRequestAt > lWaitUntil then
+        lWaitUntil := FNextRequestAt;
+      lNow := TThread.GetTickCount64;
+      if lNow >= lWaitUntil then
+      begin
+        FNextRequestAt := lNow + FMinRequestIntervalMs;
+        Exit;
+      end;
     finally
       FLock.Leave;
     end;
-    lNow := TThread.GetTickCount64;
-    if lNow >= lWaitUntil then
-      Exit;
     TThread.Sleep(250);
   end;
 end;
@@ -102,21 +117,61 @@ var
 begin
   FLock.Enter;
   try
+    lDeadline := TThread.GetTickCount64 + FMinRequestIntervalMs;
+    if lDeadline > FNextRequestAt then
+      FNextRequestAt := lDeadline;
+    if IsThrottleMessage(aOutput) then
+    begin
+      Inc(FConsecutiveThrottles);
+      FEffectiveWorkers := 1;
+      FTerminal := FConsecutiveThrottles >= CTerminalThrottleAttempt;
+      lDelay := DelayForAttempt(FConsecutiveThrottles);
+      lDeadline := TThread.GetTickCount64 + lDelay;
+      if lDeadline > FCooldownUntil then
+        FCooldownUntil := lDeadline;
+      Exit;
+    end;
     if aExitCode = 0 then
     begin
       FConsecutiveThrottles := 0;
-      Exit;
+      FTerminal := False;
     end;
-    if not IsThrottleMessage(aOutput) then
-      Exit;
-    Inc(FConsecutiveThrottles);
-    FEffectiveWorkers := 1;
-    lDelay := DelayForAttempt(FConsecutiveThrottles);
-    lDeadline := TThread.GetTickCount64 + lDelay;
-    if lDeadline > FCooldownUntil then
-      FCooldownUntil := lDeadline;
-    if FConsecutiveThrottles >= High(CThrottleDelays) then
-      FTerminal := True;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+procedure TThrottleController.SetMinRequestInterval(const aValueMs: Cardinal);
+begin
+  FLock.Enter;
+  try
+    FMinRequestIntervalMs := aValueMs;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TThrottleController.CooldownRemainingMs: Cardinal;
+var
+  lNow: UInt64;
+begin
+  FLock.Enter;
+  try
+    lNow := TThread.GetTickCount64;
+    if FCooldownUntil > lNow then
+      Result := Cardinal(FCooldownUntil - lNow)
+    else
+      Result := 0;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TThrottleController.ThrottleAttempt: Integer;
+begin
+  FLock.Enter;
+  try
+    Result := FConsecutiveThrottles;
   finally
     FLock.Leave;
   end;

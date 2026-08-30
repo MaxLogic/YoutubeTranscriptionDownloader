@@ -1,12 +1,16 @@
 # Copy this file to download.yaml, then edit the queue.
 schema: 1
-mode: fresh # fresh, failed, or all
+mode: fresh # fresh, failed, throttled, or all
 
 defaults:
   language: en
   output_dir: output
   jobs: 1
-  delay_jitter_ms: 1200
+  request_interval_ms: 3000
+  delay_jitter_ms: 2000
+  sleep_requests_seconds: 1
+  sleep_subtitles_seconds: 3
+  socket_timeout_seconds: 60
 
 groups:
   # The subfolder applies to every channel and video in this group.

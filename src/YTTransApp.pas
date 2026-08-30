@@ -47,8 +47,13 @@ type
     CookiesFromBrowser: String;
     CookiesFileExplicit: Boolean;
     CookiesFromBrowserExplicit: Boolean;
+    RequestIntervalMs: Integer;
     DelayJitterMs: Integer;
+    SleepRequestsSeconds: Integer;
+    SleepSubtitlesSeconds: Integer;
+    SocketTimeoutSeconds: Integer;
     RetryUnavailable: Boolean;
+    RetryThrottledOnly: Boolean;
   end;
 
   TTranscriptMetadata = record
@@ -126,7 +131,11 @@ resourcestring
     '  --cookies <file>        Pass yt-dlp cookies file for authenticated requests.' + sLineBreak +
     '  --cookies-from-browser <browser>  Load cookies from browser profile (yt-dlp syntax).' + sLineBreak +
     '                            Defaults can be set in settings.ini [default] cookies_file/cookies_from_browser.' + sLineBreak +
+    '  --request-interval-ms <n>  Minimum delay between yt-dlp invocations. Default: 3000.' + sLineBreak +
     '  -dj, --delay-jitter-ms <n>  Max per-item jitter delay in ms for channel mode pacing.' + sLineBreak +
+    '  --sleep-requests <n>    yt-dlp delay between extraction requests in seconds. Default: 1.' + sLineBreak +
+    '  --sleep-subtitles <n>   yt-dlp delay before subtitle downloads in seconds. Default: 3.' + sLineBreak +
+    '  --socket-timeout <n>    yt-dlp network socket timeout in seconds. Default: 60; 0 uses yt-dlp default.' + sLineBreak +
     '  -ru, --retry-unavailable  Retry videos recorded as having no transcript.' + sLineBreak +
     '  -h, --help              Show this help and exit.' + sLineBreak;
 
@@ -150,10 +159,15 @@ const
   CUnavailableManifestSchema = 2;
   CRetryAttempts = 4;
   CRetryBaseDelayMs = 600;
-  CThrottleRetryDelaysMs: array[1..3] of Integer = (30000, 120000, 300000);
-  CMaxThrottleCooldownMs = 300000;
+  CDefaultRequestIntervalMs = 3000;
   CDefaultDelayJitterMs = 1200;
+  CDefaultSleepRequestsSeconds = 1;
+  CDefaultSleepSubtitlesSeconds = 3;
+  CDefaultSocketTimeoutSeconds = 60;
   CDefaultChannelJobsCap = 1;
+  CProgressIntervalItems = 100;
+  CProgressIntervalMs = 60000;
+  CDefaultPersistedThrottleCooldownMs = 600000;
 
 type
   TChannelConflictAction = (ccaWriteNew, ccaOverwrite, ccaSkip);
@@ -166,6 +180,9 @@ type
     UnavailableCached: Integer;
     Failed: Integer;
   end;
+
+  TChannelProgressCallback = reference to procedure(
+    const aProcessed, aTotal: Integer; const aStats: TChannelRunStats);
 
   TUnavailableVideo = record
     VideoId: string;
@@ -188,6 +205,8 @@ type
     property Metadata: TTranscriptMetadata read FMetadata;
   end;
 
+  EThrottleError = class(Exception);
+
 var
   GThrottleController: TThrottleController;
 
@@ -199,23 +218,14 @@ begin
   FMetadata := aMetadata;
 end;
 
-function GetThrottleRetryDelayMs(const aAttempt: Integer): Integer;
-var
-  lIndex: Integer;
-begin
-  lIndex := aAttempt;
-  if lIndex < Low(CThrottleRetryDelaysMs) then
-    lIndex := Low(CThrottleRetryDelaysMs)
-  else if lIndex > High(CThrottleRetryDelaysMs) then
-    lIndex := High(CThrottleRetryDelaysMs);
-  Result := CThrottleRetryDelaysMs[lIndex];
-  if Result > CMaxThrottleCooldownMs then
-    Result := CMaxThrottleCooldownMs;
-end;
-
 function UtcNowIso: string;
 begin
   Result := DateToISO8601(TTimeZone.Local.ToUniversalTime(Now), True);
+end;
+
+function UtcNow: TDateTime;
+begin
+  Result := TTimeZone.Local.ToUniversalTime(Now);
 end;
 
 function JsonText(const aObject: TJSONObject; const aName: string): string;
@@ -809,11 +819,22 @@ begin
     Result := CDefaultChannelJobsCap;
 end;
 
+function BuildYtDlpPacingArguments(const aConfig: TCommandLineConfig): string;
+begin
+  Result := '';
+  if aConfig.SleepRequestsSeconds > 0 then
+    Result := Result + Format(' --sleep-requests %d', [aConfig.SleepRequestsSeconds]);
+  if aConfig.SleepSubtitlesSeconds > 0 then
+    Result := Result + Format(' --sleep-subtitles %d', [aConfig.SleepSubtitlesSeconds]);
+  if aConfig.SocketTimeoutSeconds > 0 then
+    Result := Result + Format(' --socket-timeout %d', [aConfig.SocketTimeoutSeconds]);
+end;
+
 function BuildYtDlpAuthArguments(const aConfig: TCommandLineConfig): string;
 var
   lCookieFile: string;
 begin
-  Result := '';
+  Result := BuildYtDlpPacingArguments(aConfig);
 
   lCookieFile := Trim(aConfig.CookiesFile);
   if lCookieFile <> '' then
@@ -1171,7 +1192,10 @@ begin
           AddUrl(lUrl);
       except
         on E: Exception do
-          WriteLn(Format('Warning: could not list uploads/videos: %s', [E.Message]));
+          if IsThrottleError(E.Message) then
+            raise
+          else
+            WriteLn(Format('Warning: could not list uploads/videos: %s', [E.Message]));
       end;
     end;
 
@@ -1184,7 +1208,10 @@ begin
           AddUrl(lUrl);
       except
         on E: Exception do
-          WriteLn(Format('Warning: could not list shorts tab: %s', [E.Message]));
+          if IsThrottleError(E.Message) then
+            raise
+          else
+            WriteLn(Format('Warning: could not list shorts tab: %s', [E.Message]));
       end;
     end;
 
@@ -1196,7 +1223,10 @@ begin
           AddUrl(lUrl);
       except
         on E: Exception do
-          WriteLn(Format('Warning: could not list live tab: %s', [E.Message]));
+          if IsThrottleError(E.Message) then
+            raise
+          else
+            WriteLn(Format('Warning: could not list live tab: %s', [E.Message]));
       end;
     end;
 
@@ -1207,8 +1237,38 @@ begin
   end;
 end;
 
+procedure ReportChannelProgress(const aLogLock: TCriticalSection;
+  const aProcessed, aTotal: Integer; const aStats: TChannelRunStats;
+  var aLastProgressTick: UInt64;
+  const aCallback: TChannelProgressCallback);
+var
+  lNow: UInt64;
+  lShouldReport: Boolean;
+begin
+  aLogLock.Enter;
+  try
+    lNow := TThread.GetTickCount64;
+    lShouldReport := (aProcessed = aTotal) or
+      ((aProcessed mod CProgressIntervalItems) = 0) or
+      (lNow - aLastProgressTick >= CProgressIntervalMs);
+    if not lShouldReport then
+      Exit;
+    aLastProgressTick := lNow;
+    WriteLn(Format(
+      'Progress: %d/%d processed; downloaded=%d skipped=%d unavailable=%d failed=%d',
+      [aProcessed, aTotal, aStats.Downloaded, aStats.Skipped,
+       aStats.Unavailable + aStats.UnavailableCached, aStats.Failed]
+    ));
+    if Assigned(aCallback) then
+      aCallback(aProcessed, aTotal, aStats);
+  finally
+    aLogLock.Leave;
+  end;
+end;
+
 function RunChannelMode(const aConfig: TCommandLineConfig;
-  out aStats: TChannelRunStats): Integer;
+  out aStats: TChannelRunStats;
+  const aProgressCallback: TChannelProgressCallback = nil): Integer;
 var
   lSetupService: TTranscriptService;
   lSeedMeta: TTranscriptMetadata;
@@ -1218,8 +1278,11 @@ var
   lEffectiveMetaOptions: TMetaOptions;
   lFileLock: TCriticalSection;
   lLogLock: TCriticalSection;
+  lHeartbeatStop: TEvent;
+  lHeartbeatTask: ITask;
   lNextIndex: Integer;
-  lCooldownUntil: Int64;
+  lProgressProcessed: Integer;
+  lLastProgressTick: UInt64;
   lWorkerTasks: TArray<ITask>;
   lWorkerCount: Integer;
   lYtDlpExtraArgs: string;
@@ -1231,6 +1294,7 @@ var
   lUnavailableManifestChanged: Boolean;
   lProcessedCount: Integer;
   lDeferredCount: Integer;
+  lProgressError: string;
 begin
   Result := 1;
   aStats := Default(TChannelRunStats);
@@ -1240,12 +1304,13 @@ begin
   try
     lSeedMeta := lSetupService.FetchMetadata(aConfig.URL, lYtDlpExtraArgs);
   except
-    on Exception do
+    on E: Exception do
     begin
-      if ShouldRetryWithoutDefaultAuth(aConfig) and (Trim(lYtDlpExtraArgs) <> '') then
+      if ShouldRetryWithoutDefaultAuth(aConfig) and
+         (Trim(lYtDlpExtraArgs) <> '') and (not IsThrottleError(E.Message)) then
       begin
         WriteLn('Warning: default cookie auth failed; retrying without cookies.');
-        lYtDlpExtraArgs := '';
+        lYtDlpExtraArgs := BuildYtDlpPacingArguments(aConfig);
         lSeedMeta := lSetupService.FetchMetadata(aConfig.URL, lYtDlpExtraArgs);
       end
       else
@@ -1263,6 +1328,8 @@ begin
   lUnavailableVideos := nil;
   lFileLock := nil;
   lLogLock := nil;
+  lHeartbeatStop := nil;
+  lHeartbeatTask := nil;
   try
     lExistingVideoIds := TDictionary<string, Byte>.Create;
     lUnavailableVideos := LoadUnavailableVideos(lChannelDir);
@@ -1289,10 +1356,12 @@ begin
     lFileLock := TCriticalSection.Create;
     lLogLock := TCriticalSection.Create;
     lNextIndex := -1;
-    lCooldownUntil := 0;
+    lProgressProcessed := 0;
+    lLastProgressTick := TThread.GetTickCount64;
     lStats := Default(TChannelRunStats);
     lActiveWorkers := 0;
     lStopScheduling := 0;
+    lProgressError := '';
 
     lWorkerCount := aConfig.Jobs;
     if lWorkerCount < 1 then
@@ -1302,7 +1371,39 @@ begin
     if lWorkerCount < 1 then
       lWorkerCount := 1;
     lWorkerLimit := lWorkerCount;
+    WriteLn('Channel: ' + lSeedMeta.Channel);
+    WriteLn(Format('Queued: %d', [Length(lVideoUrls)]));
+    WriteLn('Output: ' + lChannelDir);
     WriteLn(Format('Workers configured: %d', [lWorkerCount]));
+
+    lHeartbeatStop := TEvent.Create(nil, True, False, '');
+    lHeartbeatTask := TTask.Run(
+      procedure
+      var
+        lHeartbeatProcessed: Integer;
+      begin
+        while lHeartbeatStop.WaitFor(CProgressIntervalMs) = wrTimeout do
+        begin
+          lHeartbeatProcessed := TInterlocked.Add(lProgressProcessed, 0);
+          try
+            ReportChannelProgress(lLogLock, lHeartbeatProcessed,
+              Length(lVideoUrls), lStats, lLastProgressTick,
+              aProgressCallback);
+          except
+            on E: Exception do
+            begin
+              lLogLock.Enter;
+              try
+                lProgressError := E.Message;
+              finally
+                lLogLock.Leave;
+              end;
+              TInterlocked.Exchange(lStopScheduling, 1);
+              Break;
+            end;
+          end;
+        end;
+      end);
 
     SetLength(lWorkerTasks, lWorkerCount);
     for var lWorkerIdx := 0 to lWorkerCount - 1 do
@@ -1318,10 +1419,8 @@ begin
           lOutputPath: string;
           lAction: TChannelConflictAction;
           lDelayMs: Integer;
-          lWaitUntil: Int64;
-          lNow: Int64;
-          lObserved: Int64;
           lFailedMessage: string;
+          lProcessedSnapshot: Integer;
           lActiveSnapshot: Integer;
           lLimitSnapshot: Integer;
           lJitterMs: Integer;
@@ -1329,6 +1428,7 @@ begin
           lVideoId: string;
           lAlreadyExists: Boolean;
           lCachedUnavailable: Boolean;
+          lCachedEntry: TUnavailableVideo;
           lUnavailableMeta: TTranscriptMetadata;
           lUnavailableEntry: TUnavailableVideo;
           lIsThrottle: Boolean;
@@ -1356,6 +1456,10 @@ begin
                 if lAlreadyExists then
                 begin
                   TInterlocked.Increment(lStats.Skipped);
+                  lProcessedSnapshot := TInterlocked.Increment(lProgressProcessed);
+                  ReportChannelProgress(lLogLock, lProcessedSnapshot,
+                    Length(lVideoUrls), lStats, lLastProgressTick,
+                    aProgressCallback);
                   Continue;
                 end;
               end;
@@ -1366,12 +1470,20 @@ begin
                 lFileLock.Enter;
                 try
                   lCachedUnavailable := (lVideoId <> '') and lUnavailableVideos.ContainsKey(lVideoId);
+                  if lCachedUnavailable and aConfig.RetryThrottledOnly and
+                     lUnavailableVideos.TryGetValue(lVideoId, lCachedEntry) and
+                     SameText(lCachedEntry.Status, 'throttled') then
+                    lCachedUnavailable := False;
                 finally
                   lFileLock.Leave;
                 end;
                 if lCachedUnavailable then
                 begin
                   TInterlocked.Increment(lStats.UnavailableCached);
+                  lProcessedSnapshot := TInterlocked.Increment(lProgressProcessed);
+                  ReportChannelProgress(lLogLock, lProcessedSnapshot,
+                    Length(lVideoUrls), lStats, lLastProgressTick,
+                    aProgressCallback);
                   Continue;
                 end;
               end;
@@ -1379,6 +1491,9 @@ begin
               while True do
               begin
                 lLimitSnapshot := TInterlocked.Add(lWorkerLimit, 0);
+                if Assigned(GThrottleController) and
+                   (GThrottleController.EffectiveWorkers < lLimitSnapshot) then
+                  lLimitSnapshot := GThrottleController.EffectiveWorkers;
                 lActiveSnapshot := TInterlocked.Add(lActiveWorkers, 0);
                 if lActiveSnapshot < lLimitSnapshot then
                 begin
@@ -1395,15 +1510,6 @@ begin
                 for lAttempt := 1 to CRetryAttempts do
                 begin
                   lDelayMs := 0;
-                  while True do
-                  begin
-                    lWaitUntil := TInterlocked.Read(lCooldownUntil);
-                    lNow := TThread.GetTickCount64;
-                    if lNow >= lWaitUntil then
-                      Break;
-                    Sleep(150);
-                  end;
-
                   lJitterMs := 0;
                   if aConfig.DelayJitterMs > 0 then
                     lJitterMs := Integer(
@@ -1456,52 +1562,24 @@ begin
                       lIsThrottle := IsThrottleError(lFailedMessage);
                       if lIsThrottle then
                       begin
-                        if lAttempt = CRetryAttempts then
-                        begin
-                          if TInterlocked.CompareExchange(lStopScheduling, 1, 0) = 0 then
-                          begin
-                            lLogLock.Enter;
-                            try
-                              WriteLn(Format(
-                                'Warning: throttling persisted after %d attempts; stopping this channel with remaining videos deferred.',
-                                [CRetryAttempts]
-                              ));
-                            finally
-                              lLogLock.Leave;
-                            end;
-                          end;
-                          Break;
-                        end;
-
-                        lDelayMs := GetThrottleRetryDelayMs(lAttempt);
-                        lDelayMs := lDelayMs + ((lIndex + lAttempt * 997) mod 5001);
-
-                        lNow := TThread.GetTickCount64;
-                        lWaitUntil := lNow + lDelayMs;
-                        repeat
-                          lObserved := TInterlocked.Read(lCooldownUntil);
-                          if lObserved >= lWaitUntil then
-                            Break;
-                        until TInterlocked.CompareExchange(lCooldownUntil, lWaitUntil, lObserved) = lObserved;
-
-                        lLimitSnapshot := TInterlocked.Exchange(lWorkerLimit, 1);
-                        if lLimitSnapshot > 1 then
+                        TInterlocked.Exchange(lWorkerLimit, 1);
+                        if TInterlocked.CompareExchange(lStopScheduling, 1, 0) = 0 then
                         begin
                           lLogLock.Enter;
                           try
-                            WriteLn('Warning: throttling detected, reducing active workers to 1');
+                            WriteLn(
+                              'Warning: shared throttle retries exhausted; stopping this channel with remaining videos deferred.'
+                            );
                           finally
                             lLogLock.Leave;
                           end;
                         end;
+                        Break;
                       end;
-                      if not lIsThrottle then
-                      begin
-                        if lAttempt = CRetryAttempts then
-                          Break;
-                        lDelayMs := CRetryBaseDelayMs * (1 shl (lAttempt - 1));
-                        lDelayMs := lDelayMs + ((lIndex + lAttempt * 53) mod 350);
-                      end;
+                      if lAttempt = CRetryAttempts then
+                        Break;
+                      lDelayMs := CRetryBaseDelayMs * (1 shl (lAttempt - 1));
+                      lDelayMs := lDelayMs + ((lIndex + lAttempt * 53) mod 350);
                       Sleep(lDelayMs);
                     end;
                   end;
@@ -1575,6 +1653,10 @@ begin
                     end;
                   end;
                 end;
+                lProcessedSnapshot := TInterlocked.Increment(lProgressProcessed);
+                ReportChannelProgress(lLogLock, lProcessedSnapshot,
+                  Length(lVideoUrls), lStats, lLastProgressTick,
+                  aProgressCallback);
               finally
                 TInterlocked.Decrement(lActiveWorkers);
               end;
@@ -1586,8 +1668,21 @@ begin
       );
     end;
 
-    TTask.WaitForAll(lWorkerTasks);
+    try
+      TTask.WaitForAll(lWorkerTasks);
+    finally
+      lHeartbeatStop.SetEvent;
+      lHeartbeatTask.Wait;
+    end;
+    if lProgressError <> '' then
+      raise Exception.Create('Channel progress checkpoint failed: ' +
+        lProgressError);
   finally
+    if Assigned(lHeartbeatStop) then
+      lHeartbeatStop.SetEvent;
+    if Assigned(lHeartbeatTask) then
+      lHeartbeatTask.Wait;
+    lHeartbeatStop.Free;
     lFileLock.Free;
     lLogLock.Free;
     lExistingVideoIds.Free;
@@ -1643,10 +1738,11 @@ begin
     begin
       if E is EMissingTranscriptError then
         aMeta := EMissingTranscriptError(E).Metadata;
-      if ShouldRetryWithoutDefaultAuth(aConfig) and (Trim(lYtDlpExtraArgs) <> '') then
+      if ShouldRetryWithoutDefaultAuth(aConfig) and
+         (Trim(lYtDlpExtraArgs) <> '') and (not IsThrottleError(E.Message)) then
       begin
         WriteLn('Warning: default cookie auth failed; retrying without cookies.');
-        lYtDlpExtraArgs := '';
+        lYtDlpExtraArgs := BuildYtDlpPacingArguments(aConfig);
         lTranscript := lService.FetchTranscript(aConfig.URL, aConfig.Language, lYtDlpExtraArgs);
       end
       else
@@ -1691,13 +1787,7 @@ begin
         if IsMissingSubtitleError(E.Message) or (lAttempt = CRetryAttempts) then
           raise;
         if IsThrottleError(E.Message) then
-        begin
-          if Assigned(GThrottleController) and GThrottleController.IsTerminal then
-            raise;
-          WriteLn(Format('Warning: YouTube throttled the request; shared cooldown before retry %d.',
-            [lAttempt + 1]));
-          Continue;
-        end;
+          raise;
         lDelayMs := CRetryBaseDelayMs * (1 shl (lAttempt - 1));
         Sleep(lDelayMs);
       end;
@@ -1731,7 +1821,11 @@ begin
   aConfig.ChannelMode := aEntry.Kind = dekChannel;
   aConfig.Language := aEntry.Options.Language;
   aConfig.Jobs := aEntry.Options.Jobs;
+  aConfig.RequestIntervalMs := aEntry.Options.RequestIntervalMs;
   aConfig.DelayJitterMs := aEntry.Options.DelayJitterMs;
+  aConfig.SleepRequestsSeconds := aEntry.Options.SleepRequestsSeconds;
+  aConfig.SleepSubtitlesSeconds := aEntry.Options.SleepSubtitlesSeconds;
+  aConfig.SocketTimeoutSeconds := aEntry.Options.SocketTimeoutSeconds;
   aConfig.IncludeShorts := aEntry.Options.IncludeShorts;
   aConfig.IncludeLive := aEntry.Options.IncludeLive;
   aConfig.OverrideExisting := aEntry.Options.OverwriteExisting;
@@ -1751,6 +1845,9 @@ begin
     aConfig.CookiesFile := '';
   end;
   aConfig.RetryUnavailable := aJob.Mode <> dmFresh;
+  aConfig.RetryThrottledOnly := aJob.Mode = dmThrottled;
+  if aConfig.RetryThrottledOnly then
+    aConfig.RetryUnavailable := False;
   aConfig.MetaOptions.VideoId := True;
 end;
 
@@ -1760,6 +1857,28 @@ begin
     Result := aOwner['state'].AsMapping
   else
     Result := aOwner.AddOrSetMapping('state');
+end;
+
+function ReplaceState(const aOwner: IYAMLMapping): IYAMLMapping;
+var
+  lComments: TStringList;
+  lInlineComment: string;
+  lOldState: IYAMLMapping;
+begin
+  lComments := TStringList.Create;
+  try
+    if aOwner.ContainsKey('state') then
+    begin
+      lOldState := aOwner['state'].AsMapping;
+      lComments.Assign(lOldState.Comments);
+      lInlineComment := lOldState.Comment;
+    end;
+    Result := aOwner.AddOrSetMapping('state');
+    Result.Comments := lComments;
+    Result.Comment := lInlineComment;
+  finally
+    lComments.Free;
+  end;
 end;
 
 procedure MarkEntryAttempt(const aEntry: TDownloadEntry);
@@ -1800,9 +1919,20 @@ end;
 procedure MarkChannelSuccess(const aEntry: TDownloadEntry;
   const aStats: TChannelRunStats);
 var
+  lAttempts: Integer;
   lState: IYAMLMapping;
 begin
-  lState := EnsureState(aEntry.Node);
+  lAttempts := 0;
+  if aEntry.Node.ContainsKey('state') then
+  begin
+    lState := aEntry.Node['state'].AsMapping;
+    if lState.ContainsKey('attempt_count') then
+      lAttempts := lState.I['attempt_count'];
+  end;
+
+  // Replace the application-owned runtime state on success. In particular,
+  // omit stale error fields instead of serializing empty strings as YAML nulls.
+  lState := ReplaceState(aEntry.Node);
   if (aStats.Failed > 0) or (aStats.Unavailable > 0) or
      (aStats.UnavailableCached > 0) then
     lState.AddOrSetValue('status', 'completed_with_errors')
@@ -1810,23 +1940,41 @@ begin
     lState.AddOrSetValue('status', 'completed');
   lState.AddOrSetValue('last_attempt_utc', UtcNowIso);
   lState.AddOrSetValue('last_success_utc', UtcNowIso);
+  lState.AddOrSetValue('attempt_count', lAttempts);
   lState.AddOrSetValue('downloaded', aStats.Downloaded);
   lState.AddOrSetValue('overwritten', aStats.Overwritten);
   lState.AddOrSetValue('skipped', aStats.Skipped);
   lState.AddOrSetValue('unavailable', aStats.Unavailable);
   lState.AddOrSetValue('unavailable_cached', aStats.UnavailableCached);
   lState.AddOrSetValue('failed', aStats.Failed);
-  lState.AddOrSetValue('error_kind', '');
-  lState.AddOrSetValue('error', '');
+end;
+
+procedure MarkChannelProgress(const aEntry: TDownloadEntry;
+  const aStats: TChannelRunStats; const aProcessed, aTotal: Integer);
+var
+  lState: IYAMLMapping;
+begin
+  lState := EnsureState(aEntry.Node);
+  lState.AddOrSetValue('status', 'running');
+  lState.AddOrSetValue('last_checkpoint_utc', UtcNowIso);
+  lState.AddOrSetValue('downloaded', aStats.Downloaded);
+  lState.AddOrSetValue('overwritten', aStats.Overwritten);
+  lState.AddOrSetValue('skipped', aStats.Skipped);
+  lState.AddOrSetValue('unavailable', aStats.Unavailable);
+  lState.AddOrSetValue('unavailable_cached', aStats.UnavailableCached);
+  lState.AddOrSetValue('failed', aStats.Failed);
+  lState.AddOrSetValue('processed', aProcessed);
+  lState.AddOrSetValue('total', aTotal);
 end;
 
 procedure UpdateJobState(const aJob: TDownloadFile; const aStatus: string;
   const aStartedUtc: string; const aProcessed, aEligibilitySkipped,
-  aFailed, aDeferred: Integer; const aTerminal: Boolean);
+  aFailed, aDeferred: Integer; const aTerminal: Boolean;
+  const aThrottleRetryAfterUtc: string = '');
 var
   lState: IYAMLMapping;
 begin
-  lState := EnsureState(aJob.Root);
+  lState := ReplaceState(aJob.Root);
   lState.AddOrSetValue('status', aStatus);
   lState.AddOrSetValue('last_run_started_utc', aStartedUtc);
   lState.AddOrSetValue('last_checkpoint_utc', UtcNowIso);
@@ -1836,6 +1984,8 @@ begin
   lState.AddOrSetValue('eligibility_skipped', aEligibilitySkipped);
   lState.AddOrSetValue('failed', aFailed);
   lState.AddOrSetValue('deferred', aDeferred);
+  if Trim(aThrottleRetryAfterUtc) <> '' then
+    lState.AddOrSetValue('throttle_retry_after_utc', aThrottleRetryAfterUtc);
 end;
 
 function FindExistingStandaloneOutput(const aOutputDir, aUrl: string;
@@ -1865,14 +2015,32 @@ var
   lConfig: TCommandLineConfig;
   lMeta: TTranscriptMetadata;
   lOutputPath, lStartedUtc, lStatus: string;
+  lRetryAfterUtc: string;
   lStats: TChannelRunStats;
   lProcessed, lSkipped, lFailed, lDeferred, lChannelResult: Integer;
+  lCooldownMs: Int64;
 begin
   Result := 1;
   lJob := TDownloadFile.Open(aFileName);
   try
+    lCooldownMs := lJob.ThrottleCooldownRemainingMs(UtcNow);
+    if lCooldownMs > 0 then
+    begin
+      lRetryAfterUtc := DateToISO8601(
+        IncMilliSecond(UtcNow, lCooldownMs), True);
+      if not (lJob.Mode in [dmThrottled, dmAll]) then
+      begin
+        WriteLn(Format(
+          'YouTube cooldown is active; retry after %s (%d seconds remaining).',
+          [lRetryAfterUtc, (lCooldownMs + 999) div 1000]));
+        Exit(2);
+      end;
+      WriteLn(Format(
+        'Warning: mode %s overrides the active YouTube cooldown ending at %s.',
+        [DownloadModeToString(lJob.Mode), lRetryAfterUtc]));
+    end;
     TryAutoUpdateYtDlp;
-    GThrottleController := TThrottleController.Create(1);
+    GThrottleController := TThrottleController.Create(1, CDefaultRequestIntervalMs);
     try
       lStartedUtc := UtcNowIso;
       lProcessed := 0;
@@ -1892,6 +2060,7 @@ begin
         lConfig := Default(TCommandLineConfig);
         LoadDefaultOptions(lConfig);
         ApplyEntryConfig(lConfig, lJob, lEntry);
+        GThrottleController.SetMinRequestInterval(lConfig.RequestIntervalMs);
         if (lEntry.Kind = dekVideo) and
            FindExistingStandaloneOutput(lConfig.OutputDir, lEntry.Url, lOutputPath) then
         begin
@@ -1911,9 +2080,18 @@ begin
         try
           if lEntry.Kind = dekChannel then
           begin
-            lChannelResult := RunChannelMode(lConfig, lStats);
+            lChannelResult := RunChannelMode(lConfig, lStats,
+              procedure(const aProcessed, aTotal: Integer;
+                const aProgressStats: TChannelRunStats)
+              begin
+                MarkChannelProgress(lEntry, aProgressStats, aProcessed, aTotal);
+                UpdateJobState(lJob, 'running', lStartedUtc, lProcessed,
+                  lSkipped, lFailed, lDeferred, False);
+                lJob.Checkpoint;
+              end);
             if lChannelResult = 2 then
-              raise Exception.Create('YouTube throttling persisted; channel processing was deferred');
+              raise EThrottleError.Create(
+                'YouTube throttling persisted; channel processing was deferred');
             MarkChannelSuccess(lEntry, lStats);
           end
           else
@@ -1937,8 +2115,13 @@ begin
             begin
               lDeferred := Length(lEntries) - lProcessed - lSkipped - lFailed;
               if lDeferred < 0 then lDeferred := 0;
+              lCooldownMs := GThrottleController.CooldownRemainingMs;
+              if lCooldownMs <= 0 then
+                lCooldownMs := CDefaultPersistedThrottleCooldownMs;
+              lRetryAfterUtc := DateToISO8601(
+                IncMilliSecond(UtcNow, lCooldownMs), True);
               UpdateJobState(lJob, 'throttled', lStartedUtc, lProcessed,
-                lSkipped, lFailed, lDeferred, True);
+                lSkipped, lFailed, lDeferred, True, lRetryAfterUtc);
               lJob.Checkpoint;
               Exit(2);
             end;
@@ -1988,7 +2171,8 @@ begin
     if lConfig.URL.IsEmpty then
       raise EArgumentException.Create('YouTube URL is a required argument.');
 
-    GThrottleController := TThrottleController.Create(lConfig.Jobs);
+    GThrottleController := TThrottleController.Create(lConfig.Jobs,
+      lConfig.RequestIntervalMs);
     try
       if lConfig.ChannelMode then
         Result := RunChannelMode(lConfig, lStats)
@@ -2016,7 +2200,11 @@ var
 begin
   Result := Default(TCommandLineConfig);
   LoadDefaultOptions(Result);
+  Result.RequestIntervalMs := CDefaultRequestIntervalMs;
   Result.DelayJitterMs := CDefaultDelayJitterMs;
+  Result.SleepRequestsSeconds := CDefaultSleepRequestsSeconds;
+  Result.SleepSubtitlesSeconds := CDefaultSleepSubtitlesSeconds;
+  Result.SocketTimeoutSeconds := CDefaultSocketTimeoutSeconds;
   lCookiesFileProvided := False;
   lCookiesBrowserProvided := False;
 
@@ -2130,6 +2318,50 @@ begin
       if lJobs < 0 then
         raise EArgumentException.CreateFmt('Option %s must be >= 0', [lArg]);
       Result.DelayJitterMs := lJobs;
+    end
+    else if lArg = '--request-interval-ms' then
+    begin
+      if (x + 1) > ParamCount then
+        raise EArgumentException.CreateFmt('Missing value for option %s', [lArg]);
+      Inc(x);
+      if not TryStrToInt(ParamStr(x), lJobs) then
+        raise EArgumentException.CreateFmt('Invalid integer value for option %s: %s', [lArg, ParamStr(x)]);
+      if lJobs < 0 then
+        raise EArgumentException.CreateFmt('Option %s must be >= 0', [lArg]);
+      Result.RequestIntervalMs := lJobs;
+    end
+    else if lArg = '--sleep-requests' then
+    begin
+      if (x + 1) > ParamCount then
+        raise EArgumentException.CreateFmt('Missing value for option %s', [lArg]);
+      Inc(x);
+      if not TryStrToInt(ParamStr(x), lJobs) then
+        raise EArgumentException.CreateFmt('Invalid integer value for option %s: %s', [lArg, ParamStr(x)]);
+      if lJobs < 0 then
+        raise EArgumentException.CreateFmt('Option %s must be >= 0', [lArg]);
+      Result.SleepRequestsSeconds := lJobs;
+    end
+    else if lArg = '--sleep-subtitles' then
+    begin
+      if (x + 1) > ParamCount then
+        raise EArgumentException.CreateFmt('Missing value for option %s', [lArg]);
+      Inc(x);
+      if not TryStrToInt(ParamStr(x), lJobs) then
+        raise EArgumentException.CreateFmt('Invalid integer value for option %s: %s', [lArg, ParamStr(x)]);
+      if lJobs < 0 then
+        raise EArgumentException.CreateFmt('Option %s must be >= 0', [lArg]);
+      Result.SleepSubtitlesSeconds := lJobs;
+    end
+    else if lArg = '--socket-timeout' then
+    begin
+      if (x + 1) > ParamCount then
+        raise EArgumentException.CreateFmt('Missing value for option %s', [lArg]);
+      Inc(x);
+      if not TryStrToInt(ParamStr(x), lJobs) then
+        raise EArgumentException.CreateFmt('Invalid integer value for option %s: %s', [lArg, ParamStr(x)]);
+      if lJobs < 0 then
+        raise EArgumentException.CreateFmt('Option %s must be >= 0', [lArg]);
+      Result.SocketTimeoutSeconds := lJobs;
     end
     else if (lArg = '-ru') or (lArg = '--retry-unavailable') then
     begin
@@ -2345,34 +2577,66 @@ var
   lCmd: string;
   lStdOut: TStringBuilder;
   lStdErr: TStringBuilder;
+  lCombined: string;
+  lMessage: string;
+  lCooldownMs: Cardinal;
+  lAttempt: Integer;
+  lRetryAtUtc: string;
 begin
-  if Assigned(GThrottleController) then
-    GThrottleController.BeforeRequest;
   lCmd := Format('"%s" %s', [GetYtDlpPath, aArguments]);
-  lStdOut := TStringBuilder.Create;
-  lStdErr := TStringBuilder.Create;
-  try
-    MaxLogic.ioutils.ExecuteFile(
-      lCmd,
-      '',
-      Result,
-      procedure(const aText: string)
-      begin
-        lStdOut.Append(aText);
-      end,
-      procedure(const aText: string)
-      begin
-        lStdErr.Append(aText);
-      end,
-      True
-    );
-    aOutput := lStdOut.ToString;
-    aError := lStdErr.ToString;
+  while True do
+  begin
     if Assigned(GThrottleController) then
-      GThrottleController.ReportResult(Result, aOutput + sLineBreak + aError);
-  finally
-    lStdErr.Free;
-    lStdOut.Free;
+      GThrottleController.BeforeRequest;
+    lStdOut := TStringBuilder.Create;
+    lStdErr := TStringBuilder.Create;
+    try
+      MaxLogic.ioutils.ExecuteFile(
+        lCmd,
+        '',
+        Result,
+        procedure(const aText: string)
+        begin
+          lStdOut.Append(aText);
+        end,
+        procedure(const aText: string)
+        begin
+          lStdErr.Append(aText);
+        end,
+        True
+      );
+      aOutput := lStdOut.ToString;
+      aError := lStdErr.ToString;
+    finally
+      lStdErr.Free;
+      lStdOut.Free;
+    end;
+
+    lCombined := aOutput + sLineBreak + aError;
+    if Assigned(GThrottleController) then
+      GThrottleController.ReportResult(Result, lCombined);
+    if not IsThrottleError(lCombined) then
+      Exit;
+
+    lMessage := NormalizeErrorMessage(lCombined);
+    if lMessage = '' then
+      lMessage := 'YouTube returned a throttling response.';
+    if not Assigned(GThrottleController) then
+      raise EThrottleError.Create(lMessage);
+    lAttempt := GThrottleController.ThrottleAttempt;
+    if GThrottleController.IsTerminal then
+      raise EThrottleError.CreateFmt(
+        'YouTube throttling persisted after %d attempts: %s',
+        [lAttempt, lMessage]
+      );
+
+    lCooldownMs := GThrottleController.CooldownRemainingMs;
+    lRetryAtUtc := DateToISO8601(
+      TTimeZone.Local.ToUniversalTime(IncMilliSecond(Now, lCooldownMs)), True);
+    WriteLn(Format(
+      'Warning: YouTube throttling detected (attempt %d); cooldown %d seconds, retry at %s.',
+      [lAttempt, (lCooldownMs + 999) div 1000, lRetryAtUtc]
+    ));
   end;
 end;
 
@@ -2397,8 +2661,6 @@ var
   lError: string;
   lExitCode: Integer;
   lJson: string;
-  lAttempt: Integer;
-  lDelayMs: Integer;
   lCommandArgs: string;
 begin
   Result := Default(TTranscriptMetadata);
@@ -2410,18 +2672,10 @@ begin
   if Trim(aYtDlpExtraArgs) <> '' then
     lCommandArgs := lCommandArgs + Trim(aYtDlpExtraArgs) + ' ';
   lCommandArgs := lCommandArgs + Format('"%s"', [aUrl]);
-  for lAttempt := 1 to CRetryAttempts do
-  begin
-    lExitCode := CaptureYtDlpOutput(lCommandArgs, lOutput, lError);
-    if lExitCode = 0 then
-      Break;
-
-    if (lAttempt >= CRetryAttempts) or (not IsThrottleError(lError)) then
-      raise Exception.CreateFmt('yt-dlp metadata fetch failed (exit %d): %s', [lExitCode, Trim(lError)]);
-
-    lDelayMs := GetThrottleRetryDelayMs(lAttempt);
-    Sleep(lDelayMs);
-  end;
+  lExitCode := CaptureYtDlpOutput(lCommandArgs, lOutput, lError);
+  if lExitCode <> 0 then
+    raise Exception.CreateFmt('yt-dlp metadata fetch failed (exit %d): %s',
+      [lExitCode, Trim(lError)]);
 
   lJson := ExtractJsonFromOutput(lOutput);
   if lJson = '' then
@@ -2457,8 +2711,6 @@ var
   lError: string;
   lExitCode: Integer;
   lJson: string;
-  lAttempt: Integer;
-  lDelayMs: Integer;
   lCommandArgs: string;
   lJsonValue: TJSONValue;
   lJsonObj: TJSONObject;
@@ -2473,18 +2725,10 @@ begin
   if Trim(aYtDlpExtraArgs) <> '' then
     lCommandArgs := lCommandArgs + Trim(aYtDlpExtraArgs) + ' ';
   lCommandArgs := lCommandArgs + Format('"%s"', [aListUrl]);
-  for lAttempt := 1 to CRetryAttempts do
-  begin
-    lExitCode := CaptureYtDlpOutput(lCommandArgs, lOutput, lError);
-    if lExitCode = 0 then
-      Break;
-
-    if (lAttempt >= CRetryAttempts) or (not IsThrottleError(lError)) then
-      raise Exception.CreateFmt('yt-dlp listing failed for %s (exit %d): %s', [aListUrl, lExitCode, Trim(lError)]);
-
-    lDelayMs := GetThrottleRetryDelayMs(lAttempt);
-    Sleep(lDelayMs);
-  end;
+  lExitCode := CaptureYtDlpOutput(lCommandArgs, lOutput, lError);
+  if lExitCode <> 0 then
+    raise Exception.CreateFmt('yt-dlp listing failed for %s (exit %d): %s',
+      [aListUrl, lExitCode, Trim(lError)]);
 
   lJson := ExtractJsonFromOutput(lOutput);
   if lJson = '' then
@@ -2540,9 +2784,8 @@ var
   lSrtContent: string;
   lMetaContent: string;
   lExitCode: Integer;
-  lStdErr: TStringBuilder;
-  lStdOut: TStringBuilder;
-  lCmd: string;
+  lOutput: string;
+  lError: string;
 begin
   Result := Default(TTranscriptResult);
   lYtDlpPath := GetYtDlpPath;
@@ -2568,40 +2811,15 @@ begin
     lParams.AppendFormat('-o "%s" ', ['transcript']);
     lParams.AppendFormat('"%s"', [aUrl]);
 
-    lCmd := Format('"%s" %s', [lYtDlpPath, lParams.ToString]);
-    lExitCode := 1;
-    lStdErr := TStringBuilder.Create;
-    lStdOut := TStringBuilder.Create;
-    try
-      if Assigned(GThrottleController) then
-        GThrottleController.BeforeRequest;
-      MaxLogic.ioutils.ExecuteFile(
-        lCmd,
-        '',
-        lExitCode,
-        procedure(const aText: string)
-        begin
-          lStdOut.Append(aText);
-        end,
-        procedure(const aText: string)
-        begin
-          lStdErr.Append(aText);
-        end,
-        True
-      );
-      if Assigned(GThrottleController) then
-        GThrottleController.ReportResult(lExitCode,
-          lStdOut.ToString + sLineBreak + lStdErr.ToString);
-    finally
-      if lExitCode <> 0 then
-      begin
-        if Trim(lStdErr.ToString) <> '' then
-          raise Exception.CreateFmt('yt-dlp transcript fetch failed (exit %d): %s', [lExitCode, Trim(lStdErr.ToString)])
-        else
-          raise Exception.CreateFmt('yt-dlp transcript fetch failed (exit %d): %s', [lExitCode, Trim(lStdOut.ToString)]);
-      end;
-      lStdOut.Free;
-      lStdErr.Free;
+    lExitCode := CaptureYtDlpOutput(lParams.ToString, lOutput, lError);
+    if lExitCode <> 0 then
+    begin
+      if Trim(lError) <> '' then
+        raise Exception.CreateFmt('yt-dlp transcript fetch failed (exit %d): %s',
+          [lExitCode, Trim(lError)])
+      else
+        raise Exception.CreateFmt('yt-dlp transcript fetch failed (exit %d): %s',
+          [lExitCode, Trim(lOutput)]);
     end;
 
     lMetaFiles := TDirectory.GetFiles(lTempDir, '*.info.json');

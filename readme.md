@@ -182,6 +182,11 @@ defaults:
   language: en
   output_dir: output
   jobs: 1
+  request_interval_ms: 3000
+  delay_jitter_ms: 2000
+  sleep_requests_seconds: 1
+  sleep_subtitles_seconds: 3
+  socket_timeout_seconds: 60
 
 groups:
   - name: MaxLogic examples
@@ -198,11 +203,12 @@ The top-level modes are:
 
 *   `fresh`: process new standalone entries and rescan healthy channels, while skipping entries and channel videos that failed previously.
 *   `failed`: retry retained failed entries and cached failures discovered within channels.
+*   `throttled`: retry only entries and channel children whose last failure was throttling; known captionless videos remain skipped.
 *   `all`: process all enabled entries and retry cached channel failures.
 
-Successfully downloaded standalone video entries are removed from the YAML file. Channel entries remain so later runs can discover new uploads. Failures retain their error category, message, attempt timestamp, and available YouTube metadata. One shared throttle controller applies across the complete file.
+Successfully downloaded standalone video entries are removed from the YAML file. Channel entries remain so later runs can discover new uploads. Failures retain their error category, message, attempt timestamp, and available YouTube metadata. One shared throttle controller applies across the complete file. After persistent throttling, the job saves `state.throttle_retry_after_utc`; normal `fresh` and `failed` runs stop without contacting YouTube until that deadline. Explicit `throttled` or `all` mode overrides the cooldown.
 
-The queue is locked while running and checkpointed through a backup plus atomic replacement after each attempted entry. If another editor changes the YAML file during a run, yttrans refuses to overwrite that edit. The complete schema is specified in [`docs/specs/2026-08-30-yaml-download-file-mode-spec.md`](docs/specs/2026-08-30-yaml-download-file-mode-spec.md).
+The queue is locked while running and checkpointed through a backup plus atomic replacement after each attempted entry. Long channels also checkpoint whenever periodic progress is reported. If another editor changes the YAML file during a run, yttrans refuses to overwrite that edit. The complete schema is specified in [`docs/specs/2026-08-30-yaml-download-file-mode-spec.md`](docs/specs/2026-08-30-yaml-download-file-mode-spec.md).
 
 ### Command-Line Arguments & Options
 
@@ -225,7 +231,11 @@ Use `yttrans` for these options. `-meta` is not a `yt-dlp` flag.
 | `-il`, `--include-live` |        | Channel mode only. Include videos from Live/Streams tab (best effort; warns if tab is missing).       |
 | `--cookies`       |              | Use yt-dlp cookies file for authenticated requests. Overrides `settings.ini` defaults.                  |
 | `--cookies-from-browser` |       | Load cookies from a browser/profile (yt-dlp syntax, e.g. `firefox:default-release`, `chrome:Profile 1`). Overrides `settings.ini` default. |
+| `--request-interval-ms` |       | Minimum delay between yt-dlp invocations (default `3000`).                                       |
 | `-dj`, `--delay-jitter-ms` |     | Max random per-item delay in milliseconds in channel mode (default `1200`).                            |
+| `--sleep-requests` |           | Delay between yt-dlp extraction requests in seconds (default `1`).                              |
+| `--sleep-subtitles` |          | Delay before yt-dlp subtitle downloads in seconds (default `3`).                                 |
+| `--socket-timeout` |           | yt-dlp network socket timeout in seconds (default `60`; `0` uses the yt-dlp default).             |
 | `-ru`, `--retry-unavailable` |   | Channel mode only. Retry videos recorded in `.yttrans-unavailable.json`.                              |
 | `-h`, `--help`    |              | Displays the help message and exits.                                                                    |
 
@@ -237,11 +247,12 @@ Use `yttrans` for these options. `-meta` is not a `yt-dlp` flag.
 *   File naming in channel mode is title-based (`<title>.md`), with conflict probing (`<title> (2).md`, ...) when title collisions refer to different `video_id`s.
 *   Existing file with same `video_id` is skipped by default; use `-ov` to overwrite.
 *   Failed channel children are saved in `<channel>/.yttrans-unavailable.json` with status, error category, URL, title, last-attempt UTC timestamp, and published timestamp when available. Existing schema-1 unavailable caches are migrated when saved.
-*   Cached failures are skipped without contacting YouTube. Use `--retry-unavailable` in direct mode, or YAML mode `failed`/`all`, to try them again. Successful retries remove their manifest entries.
+*   Cached failures are skipped without contacting YouTube. Use `--retry-unavailable` in direct mode, YAML mode `throttled` for transient throttle failures, or `failed`/`all` for every cached failure. Successful retries remove their manifest entries.
 *   Requested subtitle language is tried first, then fallback to default language (`en`) when that language is unavailable.
 *   Processing is best-effort: failed videos are reported as warnings and do not stop the whole channel run.
-*   On HTTP 429 or another throttling signal, the tool reduces active concurrency to one and waits about 30 seconds, 2 minutes, then 5 minutes. Persistent throttling stops the channel and reports unprocessed videos as deferred.
-*   YAML file mode shares that cooldown across every channel and standalone video in the queue. A terminal throttle is checkpointed and stops the job; a later `fresh` run skips the retained item, while `failed` or `all` retries it.
+*   The channel name, queue size, output directory, and worker count are printed before item processing. Progress is printed every 100 items, at completion, or after 60 seconds without another progress report.
+*   On HTTP 429 or another throttling signal, the tool reduces active concurrency to one, reports the retry timestamp, waits 2 minutes, then 10 minutes. A third consecutive throttle stops the channel and reports unprocessed videos as deferred.
+*   YAML file mode shares pacing and cooldown state across every channel and standalone video in the queue. A terminal throttle is checkpointed and stops the job; a later `fresh` run skips the retained item, while `throttled`, `failed`, or `all` can retry it.
 
 ### Anti-Bot Guidance
 
@@ -252,8 +263,10 @@ Use `yttrans` for these options. `-meta` is not a `yt-dlp` flag.
     *   default is `1`;
     *   raise with `-j` only when the channel is stable and not rate-limited.
 *   Keep pacing enabled:
-    *   default per-item jitter is `1200ms`;
-    *   tune with `--delay-jitter-ms` if needed.
+    *   yt-dlp invocations are at least `3000ms` apart;
+    *   yt-dlp waits `1s` between extraction requests and `3s` before subtitle downloads;
+    *   file-mode examples add up to `2000ms` per-item jitter;
+    *   tune with the pacing options above if needed.
 *   If YouTube challenges requests, rerun with cookies first before increasing worker count.
 *   YouTube does not publish a fixed wait that clears website rate limiting. The [yt-dlp 429 guidance](https://github.com/yt-dlp/yt-dlp/wiki/FAQ#http-error-429-too-many-requests-or-402-payment-required) describes it as an IP soft block that may require solving a CAPTCHA and passing matching browser cookies.
 
