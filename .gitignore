@@ -86,6 +86,7 @@ modules/
 /output
 /run.bat
 /run.log
+/settings.ini
 /download.yaml
 /download.yaml.bak
 /download.yaml.lock
