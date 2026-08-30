@@ -85,3 +85,9 @@ modules/
 /nofile.cookies.txt
 /output
 /run.bat
+/run.log
+/download.yaml
+/download.yaml.bak
+.agents/
+.codex/
+.claude/skills/
