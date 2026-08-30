@@ -150,6 +150,7 @@ type
     Downloaded: Integer;
     Overwritten: Integer;
     Skipped: Integer;
+    Unavailable: Integer;
     Failed: Integer;
   end;
 
@@ -971,6 +972,7 @@ var
   lActiveWorkers: Integer;
   lWorkerLimit: Integer;
   lThrottleScore: Integer;
+  lExistingVideoIds: TDictionary<string, Byte>;
 begin
   Result := 1;
 
@@ -983,6 +985,14 @@ begin
 
   lChannelDir := BuildChannelOutputDir(aConfig, lSeedMeta);
   TDirectory.CreateDirectory(lChannelDir);
+
+  lExistingVideoIds := TDictionary<string, Byte>.Create;
+  for var lExistingFile in TDirectory.GetFiles(lChannelDir, '*.md', TSearchOption.soTopDirectoryOnly) do
+  begin
+    var lExistingVideoId := Trim(ReadFrontMatterValue(lExistingFile, 'video_id')).ToLower;
+    if (lExistingVideoId <> '') and (not lExistingVideoIds.ContainsKey(lExistingVideoId)) then
+      lExistingVideoIds.Add(lExistingVideoId, 1);
+  end;
 
   lEffectiveMetaOptions := aConfig.MetaOptions;
   lEffectiveMetaOptions.Channel := True;
@@ -1032,6 +1042,9 @@ begin
           lThrottleValue: Integer;
           lDelayFloor: Integer;
           lJitterMs: Integer;
+          lUnavailable: Boolean;
+          lVideoId: string;
+          lAlreadyExists: Boolean;
         begin
           Sleep(lWorkerIdx * 150);
           lService := TTranscriptService.Create;
@@ -1041,6 +1054,22 @@ begin
               lIndex := TInterlocked.Increment(lNextIndex);
               if lIndex >= Length(lVideoUrls) then
                 Break;
+
+              if not aConfig.OverrideExisting then
+              begin
+                lVideoId := ExtractVideoIdFromUrl(lVideoUrls[lIndex]).ToLower;
+                lFileLock.Enter;
+                try
+                  lAlreadyExists := (lVideoId <> '') and lExistingVideoIds.ContainsKey(lVideoId);
+                finally
+                  lFileLock.Leave;
+                end;
+                if lAlreadyExists then
+                begin
+                  TInterlocked.Increment(lStats.Skipped);
+                  Continue;
+                end;
+              end;
 
               while True do
               begin
@@ -1056,6 +1085,7 @@ begin
 
               try
                 lFailedMessage := '';
+                lUnavailable := False;
                 for lAttempt := 1 to CRetryAttempts do
                 begin
                   while True do
@@ -1105,6 +1135,11 @@ begin
                     on E: Exception do
                     begin
                       lFailedMessage := E.Message;
+                      if IsMissingSubtitleError(lFailedMessage) then
+                      begin
+                        lUnavailable := True;
+                        Break;
+                      end;
                       if lAttempt = CRetryAttempts then
                         Break;
 
@@ -1152,11 +1187,17 @@ begin
 
                 if lFailedMessage <> '' then
                 begin
-                  TInterlocked.Increment(lStats.Failed);
+                  if lUnavailable then
+                    TInterlocked.Increment(lStats.Unavailable)
+                  else
+                    TInterlocked.Increment(lStats.Failed);
                   try
                     lLogLock.Enter;
                     try
-                      WriteLn(Format('Warning: failed to process %s (%s)', [lVideoUrls[lIndex], lFailedMessage]));
+                      if lUnavailable then
+                        WriteLn(Format('Unavailable: no transcript for %s', [lVideoUrls[lIndex]]))
+                      else
+                        WriteLn(Format('Warning: failed to process %s (%s)', [lVideoUrls[lIndex], lFailedMessage]));
                     finally
                       lLogLock.Leave;
                     end;
@@ -1182,6 +1223,7 @@ begin
   finally
     lFileLock.Free;
     lLogLock.Free;
+    lExistingVideoIds.Free;
   end;
 
   WriteLn('Channel download completed.');
@@ -1193,6 +1235,7 @@ begin
   WriteLn(Format('Downloaded: %d', [lStats.Downloaded]));
   WriteLn(Format('Overwritten: %d', [lStats.Overwritten]));
   WriteLn(Format('Skipped: %d', [lStats.Skipped]));
+  WriteLn(Format('Unavailable: %d', [lStats.Unavailable]));
   WriteLn(Format('Failed: %d', [lStats.Failed]));
 
   Result := 0;
@@ -1767,6 +1810,7 @@ begin
     gc(lParams, TStringBuilder.Create);
 
     lParams.Append('--skip-download ');
+    lParams.Append('--write-sub ');
     lParams.Append('--write-auto-sub ');
     lParams.Append('--sub-format srt ');
     lParams.AppendFormat('--sub-lang %s ', [aLanguage]);
