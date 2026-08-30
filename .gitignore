@@ -88,6 +88,12 @@ modules/
 /run.log
 /download.yaml
 /download.yaml.bak
+/download.yaml.lock
+/_build/
+/src/msbuild.log
+/tests/.dak/
+/tests/msbuild.log
+/tests/YTTrans.DownloadFile.Tests.res
 .agents/
 .codex/
 .claude/skills/

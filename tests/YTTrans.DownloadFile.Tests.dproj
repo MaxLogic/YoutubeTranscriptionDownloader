@@ -1,0 +1,74 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <ProjectGuid>{F5F14F58-220A-420B-B16A-3BA4AA24BA26}</ProjectGuid>
+    <ProjectVersion>20.4</ProjectVersion>
+    <MainSource>YTTrans.DownloadFile.Tests.dpr</MainSource>
+    <Base>True</Base>
+    <Config Condition="'$(Config)'==''">Release</Config>
+    <Platform Condition="'$(Platform)'==''">Win32</Platform>
+    <TargetedPlatforms>1</TargetedPlatforms>
+    <AppType>Console</AppType>
+    <FrameworkType>None</FrameworkType>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Config)'=='Base' or '$(Base)'!=''">
+    <Base>true</Base>
+  </PropertyGroup>
+  <PropertyGroup Condition="('$(Platform)'=='Win32' and '$(Base)'=='true') or '$(Base_Win32)'!=''">
+    <Base_Win32>true</Base_Win32>
+    <CfgParent>Base</CfgParent>
+    <Base>true</Base>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Config)'=='Release' or '$(Cfg_1)'!=''">
+    <Cfg_1>true</Cfg_1>
+    <CfgParent>Base</CfgParent>
+    <Base>true</Base>
+  </PropertyGroup>
+  <PropertyGroup Condition="('$(Platform)'=='Win32' and '$(Cfg_1)'=='true') or '$(Cfg_1_Win32)'!=''">
+    <Cfg_1_Win32>true</Cfg_1_Win32>
+    <CfgParent>Cfg_1</CfgParent>
+    <Cfg_1>true</Cfg_1>
+    <Base>true</Base>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Base)'!=''">
+    <DPMCompiler>delphi13.0</DPMCompiler>
+    <DPMCache Condition="'$(DPMCache)'==''">$(APPDATA)\.dpm\package_cache</DPMCache>
+    <DCC_UnitSearchPath>$(DPMCache)\$(DPMCompiler)\VSoft.DUnitX\0.4.6\lib\Win32;..\src;..\third_party\VSoft.YAML\Source;f:\projects\maxlogic\maxlogicfoundation;$(DCC_UnitSearchPath)</DCC_UnitSearchPath>
+    <DCC_DcuOutput>..\_build\dcu\$(MSBuildProjectName)\$(Platform)\$(Config)</DCC_DcuOutput>
+    <DCC_ExeOutput>..\_build\tests\$(Platform)\$(Config)</DCC_ExeOutput>
+    <DCC_Namespace>System;Winapi;$(DCC_Namespace)</DCC_Namespace>
+    <Manifest_File>(None)</Manifest_File>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Base_Win32)'!=''">
+    <VerInfo_IncludeVerInfo>true</VerInfo_IncludeVerInfo>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Cfg_1)'!=''">
+    <DCC_LocalDebugSymbols>false</DCC_LocalDebugSymbols>
+    <DCC_DebugInformation>0</DCC_DebugInformation>
+    <DCC_SymbolReferenceInfo>0</DCC_SymbolReferenceInfo>
+    <DCC_Define>RELEASE;$(DCC_Define)</DCC_Define>
+  </PropertyGroup>
+  <ItemGroup>
+    <DelphiCompile Include="$(MainSource)">
+      <MainSource>MainSource</MainSource>
+    </DelphiCompile>
+    <DCCReference Include="YTTrans.DownloadFile.Tests.pas"/>
+    <BuildConfiguration Include="Release">
+      <Key>Cfg_1</Key>
+      <CfgParent>Base</CfgParent>
+    </BuildConfiguration>
+    <BuildConfiguration Include="Base">
+      <Key>Base</Key>
+    </BuildConfiguration>
+  </ItemGroup>
+  <ProjectExtensions>
+    <Borland.Personality>Delphi.Personality.12</Borland.Personality>
+    <Borland.ProjectType/>
+    <BorlandProject>
+      <Delphi.Personality>
+        <Source><Source Name="MainSource">YTTrans.DownloadFile.Tests.dpr</Source></Source>
+        <Platforms><Platform value="Win32">True</Platform></Platforms>
+      </Delphi.Personality>
+    </BorlandProject>
+  </ProjectExtensions>
+  <Import Project="$(BDS)\Bin\CodeGear.Delphi.Targets" Condition="Exists('$(BDS)\Bin\CodeGear.Delphi.Targets')"/>
+</Project>

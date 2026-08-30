@@ -26,6 +26,7 @@ type
 
   TCommandLineConfig = record
     URL        : String;
+    DownloadFileName: String;
     OutputTarget: String;    // Empty = no explicit output target
     OutputDir  : String;     // From settings.ini [default] output_dir (absolute)
     Language   : String;     // e.g. 'en', 'pl'
@@ -36,6 +37,7 @@ type
     PrefixSeparator: String;
     MetaOptions: TMetaOptions;
     ChannelMode: Boolean;
+    FileMode: Boolean;
     Jobs: Integer;
     OverrideExisting: Boolean;
     ChannelOutputRoot: String;
@@ -87,6 +89,7 @@ type
 
 function ParseCommandLine: TCommandLineConfig;
 function Run: Integer;
+function IsYouTubeVideoUrl(const aUrl: string): Boolean;
 
 
 implementation
@@ -94,7 +97,7 @@ implementation
 uses
   System.IOUtils, System.IniFiles, System.JSON, System.StrUtils, System.DateUtils,
   System.SyncObjs, System.Threading, System.Generics.Collections, Winapi.Windows,
-  autoFree, MaxLogic.ioUtils;
+  autoFree, MaxLogic.ioUtils, YTTrans.DownloadFile, YTTrans.Throttle, VSoft.YAML;
 
 resourcestring
   RSUsage =
@@ -104,6 +107,7 @@ resourcestring
     sLineBreak +
     'Arguments:' + sLineBreak +
     '  <URL>                   The full URL of the YouTube video.' + sLineBreak +
+    '  -f, --file <yaml>       Process one mutable YAML download queue.' + sLineBreak +
     sLineBreak +
     'Options:' + sLineBreak +
     '  -l, --lang <lang_code>  Language code for subtitles (e.g., "en", "pl"). default is "en".' + sLineBreak +
@@ -141,7 +145,7 @@ const
   CMetaSection = 'meta';
   CDefaultLanguage = 'en';
   CUnavailableManifestFileName = '.yttrans-unavailable.json';
-  CUnavailableManifestSchema = 1;
+  CUnavailableManifestSchema = 2;
   CRetryAttempts = 4;
   CRetryBaseDelayMs = 600;
   CThrottleRetryDelaysMs: array[1..3] of Integer = (30000, 120000, 300000);
@@ -167,6 +171,9 @@ type
     Title: string;
     PublishedAt: string;
     LastAttemptUtc: string;
+    Status: string;
+    ErrorKind: string;
+    ErrorMessage: string;
   end;
 
   TUnavailableVideoMap = TDictionary<string, TUnavailableVideo>;
@@ -178,6 +185,9 @@ type
     constructor Create(const aMessage: string; const aMetadata: TTranscriptMetadata);
     property Metadata: TTranscriptMetadata read FMetadata;
   end;
+
+var
+  GThrottleController: TThrottleController;
 
 constructor EMissingTranscriptError.Create(
   const aMessage: string;
@@ -257,7 +267,7 @@ begin
     lRoot := TJSONObject(lJsonValue);
     try
       lSchema := StrToIntDef(JsonText(lRoot, 'schema'), -1);
-      if lSchema <> CUnavailableManifestSchema then
+      if (lSchema <> 1) and (lSchema <> CUnavailableManifestSchema) then
         raise EConvertError.CreateFmt(
           'Unsupported unavailable-video manifest schema %d in %s',
           [lSchema, lManifestPath]
@@ -281,6 +291,17 @@ begin
         lEntry.Title := JsonText(lItem, 'title');
         lEntry.PublishedAt := JsonText(lItem, 'published_at');
         lEntry.LastAttemptUtc := JsonText(lItem, 'last_attempt_utc');
+        if lSchema = 1 then
+        begin
+          lEntry.Status := 'unavailable';
+          lEntry.ErrorKind := 'unavailable';
+        end
+        else
+        begin
+          lEntry.Status := JsonText(lItem, 'status');
+          lEntry.ErrorKind := JsonText(lItem, 'error_kind');
+          lEntry.ErrorMessage := JsonText(lItem, 'error');
+        end;
         Result.AddOrSetValue(lEntry.VideoId.ToLower, lEntry);
       end;
     finally
@@ -326,6 +347,9 @@ begin
       lItem.AddPair('title', lEntry.Title);
       lItem.AddPair('published_at', lEntry.PublishedAt);
       lItem.AddPair('last_attempt_utc', lEntry.LastAttemptUtc);
+      lItem.AddPair('status', lEntry.Status);
+      lItem.AddPair('error_kind', lEntry.ErrorKind);
+      lItem.AddPair('error', lEntry.ErrorMessage);
       lArray.AddElement(lItem);
     end;
 
@@ -806,15 +830,36 @@ begin
 end;
 
 function IsThrottleError(const aMessage: string): Boolean;
-var
-  lMsg: string;
 begin
-  lMsg := aMessage.ToLower;
-  Result := (Pos('429', lMsg) > 0) or
-    (Pos('too many requests', lMsg) > 0) or
-    (Pos('rate limit', lMsg) > 0) or
-    (Pos('sign in to confirm', lMsg) > 0) or
-    (Pos('captcha', lMsg) > 0);
+  Result := TThrottleController.IsThrottleMessage(aMessage);
+end;
+
+function NormalizeErrorMessage(const aMessage: string): string;
+begin
+  Result := StringReplace(Trim(aMessage), #13, ' ', [rfReplaceAll]);
+  Result := StringReplace(Result, #10, ' ', [rfReplaceAll]);
+  while Pos('  ', Result) > 0 do
+    Result := StringReplace(Result, '  ', ' ', [rfReplaceAll]);
+  if Length(Result) > 2048 then
+    SetLength(Result, 2048);
+end;
+
+function ClassifyError(const aMessage: string): string;
+var
+  lText: string;
+begin
+  lText := LowerCase(aMessage);
+  if IsMissingSubtitleError(aMessage) then
+    Exit('unavailable');
+  if IsThrottleError(aMessage) then
+    Exit('throttled');
+  if ContainsText(lText, 'cookie') or ContainsText(lText, 'sign in') or
+     ContainsText(lText, 'authentication') then
+    Exit('authentication');
+  if ContainsText(lText, 'network') or ContainsText(lText, 'timeout') or
+     ContainsText(lText, 'connection') then
+    Exit('network');
+  Result := 'other';
 end;
 
 function ExtractVideoIdFromUrl(const aUrl: string): string;
@@ -871,6 +916,11 @@ begin
 
   if Pos('://', lUrl) = 0 then
     Result := lUrl;
+end;
+
+function IsYouTubeVideoUrl(const aUrl: string): Boolean;
+begin
+  Result := ExtractVideoIdFromUrl(aUrl) <> '';
 end;
 
 function NormalizeVideoUrl(const aCandidate: string): string;
@@ -963,7 +1013,7 @@ begin
   lLines := TStringList.Create;
   try
     lLines.Text := lText;
-    if lLines.Count = 0 then
+    if lLines.Count < 2 then
       Exit;
     if Trim(lLines[0]) <> '---' then
       Exit;
@@ -1090,7 +1140,8 @@ begin
   lUrls := TList<string>.Create;
   lSeen := TDictionary<string, Byte>.Create;
   try
-    AddUrl(aConfig.URL);
+    if ExtractVideoIdFromUrl(aConfig.URL) <> '' then
+      AddUrl(aConfig.URL);
 
     lSource := BuildUploadsPlaylistUrl(aSeedMeta.ChannelId);
     if lSource = '' then
@@ -1144,7 +1195,8 @@ begin
   end;
 end;
 
-function RunChannelMode(const aConfig: TCommandLineConfig): Integer;
+function RunChannelMode(const aConfig: TCommandLineConfig;
+  out aStats: TChannelRunStats): Integer;
 var
   lSetupService: TTranscriptService;
   lSeedMeta: TTranscriptMetadata;
@@ -1169,6 +1221,7 @@ var
   lDeferredCount: Integer;
 begin
   Result := 1;
+  aStats := Default(TChannelRunStats);
 
   lYtDlpExtraArgs := BuildYtDlpAuthArguments(aConfig);
   gc(lSetupService, TTranscriptService.Create);
@@ -1441,6 +1494,9 @@ begin
                     lUnavailableEntry.Title := lUnavailableMeta.Title;
                     lUnavailableEntry.PublishedAt := lUnavailableMeta.PublishedAt;
                     lUnavailableEntry.LastAttemptUtc := UtcNowIso;
+                    lUnavailableEntry.Status := 'unavailable';
+                    lUnavailableEntry.ErrorKind := 'unavailable';
+                    lUnavailableEntry.ErrorMessage := NormalizeErrorMessage(lFailedMessage);
                     if lUnavailableEntry.VideoId <> '' then
                     begin
                       lFileLock.Enter;
@@ -1453,7 +1509,29 @@ begin
                     end;
                   end
                   else
+                  begin
                     TInterlocked.Increment(lStats.Failed);
+                    lUnavailableEntry := Default(TUnavailableVideo);
+                    lUnavailableEntry.VideoId := ExtractVideoIdFromUrl(lVideoUrls[lIndex]);
+                    lUnavailableEntry.Url := lVideoUrls[lIndex];
+                    lUnavailableEntry.LastAttemptUtc := UtcNowIso;
+                    lUnavailableEntry.ErrorKind := ClassifyError(lFailedMessage);
+                    if lUnavailableEntry.ErrorKind = 'throttled' then
+                      lUnavailableEntry.Status := 'throttled'
+                    else
+                      lUnavailableEntry.Status := 'failed';
+                    lUnavailableEntry.ErrorMessage := NormalizeErrorMessage(lFailedMessage);
+                    if lUnavailableEntry.VideoId <> '' then
+                    begin
+                      lFileLock.Enter;
+                      try
+                        lUnavailableVideos.AddOrSetValue(lUnavailableEntry.VideoId.ToLower, lUnavailableEntry);
+                        SaveUnavailableVideos(lChannelDir, lUnavailableVideos);
+                      finally
+                        lFileLock.Leave;
+                      end;
+                    end;
+                  end;
                   try
                     lLogLock.Enter;
                     try
@@ -1510,22 +1588,358 @@ begin
   WriteLn(Format('Unavailable cached: %d', [lStats.UnavailableCached]));
   WriteLn(Format('Failed: %d', [lStats.Failed]));
 
-  Result := 0;
+  aStats := lStats;
+  if aConfig.FileMode and (TInterlocked.Add(lStopScheduling, 0) <> 0) then
+    Result := 2
+  else
+    Result := 0;
 end;
 
-function Run: Integer;
+function RunSingleVideo(const aConfig: TCommandLineConfig;
+  out aMeta: TTranscriptMetadata; out aOutputPath: string): Integer;
 var
-  lConfig     : TCommandLineConfig;
   lOutputText : String;
   lService    : TTranscriptService;
-  lResult     : TTranscriptResult;
+  lTranscript : TTranscriptResult;
   lOutputDir  : string;
   lMetaOptions: TMetaOptions;
   lYtDlpExtraArgs: string;
 begin
-  Result := 1; // Default to error
+  Result := 1;
+  aMeta := Default(TTranscriptMetadata);
+  aOutputPath := '';
+  lYtDlpExtraArgs := BuildYtDlpAuthArguments(aConfig);
+  gc(lService, TTranscriptService.Create);
+  try
+    lTranscript := lService.FetchTranscript(aConfig.URL, aConfig.Language, lYtDlpExtraArgs);
+  except
+    on E: Exception do
+    begin
+      if E is EMissingTranscriptError then
+        aMeta := EMissingTranscriptError(E).Metadata;
+      raise;
+    end;
+  end;
+  lOutputText := lTranscript.Transcript;
+  lMetaOptions := aConfig.MetaOptions;
+  if aConfig.FileMode then
+    lMetaOptions.VideoId := True;
+  if aConfig.IncludeMeta or aConfig.FileMode then
+    lOutputText := BuildMetaSection(lTranscript.Meta, aConfig.Keywords, lMetaOptions) + lOutputText;
+
+  aOutputPath := BuildOutputFilePath(aConfig, lTranscript.Meta);
+  if aOutputPath.IsEmpty then
+    WriteLn(lOutputText)
+  else
+  begin
+    aOutputPath := EnsureUniqueFilePath(aOutputPath);
+    lOutputDir := ExtractFileDir(aOutputPath);
+    if not lOutputDir.IsEmpty then
+      TDirectory.CreateDirectory(lOutputDir);
+    TFile.WriteAllText(aOutputPath, lOutputText, TEncoding.UTF8);
+    WriteLn('Transcript saved to: ', aOutputPath);
+  end;
+  aMeta := lTranscript.Meta;
+  Result := 0;
+end;
+
+function RunSingleVideoWithRetries(const aConfig: TCommandLineConfig;
+  out aMeta: TTranscriptMetadata; out aOutputPath: string): Integer;
+var
+  lAttempt, lDelayMs: Integer;
+begin
+  for lAttempt := 1 to CRetryAttempts do
+  begin
+    try
+      Exit(RunSingleVideo(aConfig, aMeta, aOutputPath));
+    except
+      on E: Exception do
+      begin
+        if IsMissingSubtitleError(E.Message) or (lAttempt = CRetryAttempts) then
+          raise;
+        if IsThrottleError(E.Message) then
+        begin
+          if Assigned(GThrottleController) and GThrottleController.IsTerminal then
+            raise;
+          WriteLn(Format('Warning: YouTube throttled the request; shared cooldown before retry %d.',
+            [lAttempt + 1]));
+          Continue;
+        end;
+        lDelayMs := CRetryBaseDelayMs * (1 shl (lAttempt - 1));
+        Sleep(lDelayMs);
+      end;
+    end;
+  end;
+  Result := 1;
+end;
+
+function CombineOutputFolder(const aRoot, aSubfolder: string): string;
+var
+  lCandidate, lRootWithSlash: string;
+begin
+  Result := TPath.GetFullPath(aRoot);
+  if Trim(aSubfolder) = '' then
+    Exit;
+  if TPath.IsPathRooted(aSubfolder) then
+    raise EDownloadFileError.Create('subfolder must be relative: ' + aSubfolder);
+  lCandidate := TPath.GetFullPath(TPath.Combine(Result, aSubfolder));
+  lRootWithSlash := IncludeTrailingPathDelimiter(Result);
+  if not StartsText(lRootWithSlash, IncludeTrailingPathDelimiter(lCandidate)) and
+     not SameText(Result, lCandidate) then
+    raise EDownloadFileError.Create('subfolder escapes output_dir: ' + aSubfolder);
+  Result := lCandidate;
+end;
+
+procedure ApplyEntryConfig(var aConfig: TCommandLineConfig;
+  const aJob: TDownloadFile; const aEntry: TDownloadEntry);
+begin
+  aConfig.URL := aEntry.Url;
+  aConfig.FileMode := True;
+  aConfig.ChannelMode := aEntry.Kind = dekChannel;
+  aConfig.Language := aEntry.Options.Language;
+  aConfig.Jobs := aEntry.Options.Jobs;
+  aConfig.DelayJitterMs := aEntry.Options.DelayJitterMs;
+  aConfig.IncludeShorts := aEntry.Options.IncludeShorts;
+  aConfig.IncludeLive := aEntry.Options.IncludeLive;
+  aConfig.OverrideExisting := aEntry.Options.OverwriteExisting;
+  aConfig.IncludeMeta := aEntry.Options.Metadata;
+  aConfig.Keywords := aEntry.Options.Keywords;
+  aConfig.OutputTarget := '';
+  aConfig.OutputDir := CombineOutputFolder(aJob.OutputRoot, aEntry.Options.Subfolder);
+  aConfig.ChannelOutputRoot := aConfig.OutputDir;
+  if Trim(aEntry.Options.Cookies) <> '' then
+  begin
+    aConfig.CookiesFile := aEntry.Options.Cookies;
+    aConfig.CookiesFromBrowser := '';
+  end;
+  if Trim(aEntry.Options.CookiesFromBrowser) <> '' then
+  begin
+    aConfig.CookiesFromBrowser := aEntry.Options.CookiesFromBrowser;
+    aConfig.CookiesFile := '';
+  end;
+  aConfig.RetryUnavailable := aJob.Mode <> dmFresh;
+  aConfig.MetaOptions.VideoId := True;
+end;
+
+function EnsureState(const aOwner: IYAMLMapping): IYAMLMapping;
+begin
+  if aOwner.ContainsKey('state') then
+    Result := aOwner['state'].AsMapping
+  else
+    Result := aOwner.AddOrSetMapping('state');
+end;
+
+procedure MarkEntryAttempt(const aEntry: TDownloadEntry);
+var
+  lState: IYAMLMapping;
+  lAttempts: Integer;
+begin
+  lState := EnsureState(aEntry.Node);
+  lAttempts := 0;
+  if lState.ContainsKey('attempt_count') then
+    lAttempts := lState.I['attempt_count'];
+  lState.AddOrSetValue('status', 'running');
+  lState.AddOrSetValue('last_attempt_utc', UtcNowIso);
+  lState.AddOrSetValue('attempt_count', lAttempts + 1);
+end;
+
+procedure MarkEntryFailure(const aEntry: TDownloadEntry; const aMessage: string;
+  const aMeta: TTranscriptMetadata);
+var
+  lKind, lStatus: string;
+  lState: IYAMLMapping;
+begin
+  lKind := ClassifyError(aMessage);
+  if lKind = 'unavailable' then lStatus := 'unavailable'
+  else if lKind = 'throttled' then lStatus := 'throttled'
+  else lStatus := 'failed';
+  lState := EnsureState(aEntry.Node);
+  lState.AddOrSetValue('status', lStatus);
+  lState.AddOrSetValue('last_attempt_utc', UtcNowIso);
+  lState.AddOrSetValue('error_kind', lKind);
+  lState.AddOrSetValue('error', NormalizeErrorMessage(aMessage));
+  if Trim(aMeta.VideoId) <> '' then
+    lState.AddOrSetValue('video_id', aMeta.VideoId);
+  if Trim(aMeta.PublishedAt) <> '' then
+    lState.AddOrSetValue('video_published_at', aMeta.PublishedAt);
+end;
+
+procedure MarkChannelSuccess(const aEntry: TDownloadEntry;
+  const aStats: TChannelRunStats);
+var
+  lState: IYAMLMapping;
+begin
+  lState := EnsureState(aEntry.Node);
+  if (aStats.Failed > 0) or (aStats.Unavailable > 0) or
+     (aStats.UnavailableCached > 0) then
+    lState.AddOrSetValue('status', 'completed_with_errors')
+  else
+    lState.AddOrSetValue('status', 'completed');
+  lState.AddOrSetValue('last_attempt_utc', UtcNowIso);
+  lState.AddOrSetValue('last_success_utc', UtcNowIso);
+  lState.AddOrSetValue('downloaded', aStats.Downloaded);
+  lState.AddOrSetValue('overwritten', aStats.Overwritten);
+  lState.AddOrSetValue('skipped', aStats.Skipped);
+  lState.AddOrSetValue('unavailable', aStats.Unavailable);
+  lState.AddOrSetValue('unavailable_cached', aStats.UnavailableCached);
+  lState.AddOrSetValue('failed', aStats.Failed);
+  lState.AddOrSetValue('error_kind', '');
+  lState.AddOrSetValue('error', '');
+end;
+
+procedure UpdateJobState(const aJob: TDownloadFile; const aStatus: string;
+  const aStartedUtc: string; const aProcessed, aEligibilitySkipped,
+  aFailed, aDeferred: Integer; const aTerminal: Boolean);
+var
+  lState: IYAMLMapping;
+begin
+  lState := EnsureState(aJob.Root);
+  lState.AddOrSetValue('status', aStatus);
+  lState.AddOrSetValue('last_run_started_utc', aStartedUtc);
+  lState.AddOrSetValue('last_checkpoint_utc', UtcNowIso);
+  if aTerminal then
+    lState.AddOrSetValue('last_run_completed_utc', UtcNowIso);
+  lState.AddOrSetValue('processed', aProcessed);
+  lState.AddOrSetValue('eligibility_skipped', aEligibilitySkipped);
+  lState.AddOrSetValue('failed', aFailed);
+  lState.AddOrSetValue('deferred', aDeferred);
+end;
+
+function FindExistingStandaloneOutput(const aOutputDir, aUrl: string;
+  out aFileName: string): Boolean;
+var
+  lVideoId: string;
+begin
+  Result := False;
+  aFileName := '';
+  lVideoId := ExtractVideoIdFromUrl(aUrl);
+  if (lVideoId = '') or not TDirectory.Exists(aOutputDir) then
+    Exit;
+  for var lCandidate in TDirectory.GetFiles(aOutputDir, '*.md',
+    TSearchOption.soTopDirectoryOnly) do
+    if SameText(Trim(ReadFrontMatterValue(lCandidate, 'video_id')), lVideoId) then
+    begin
+      aFileName := lCandidate;
+      Exit(True);
+    end;
+end;
+
+function RunDownloadFile(const aFileName: string): Integer;
+var
+  lJob: TDownloadFile;
+  lEntries: TArray<TDownloadEntry>;
+  lEntry: TDownloadEntry;
+  lConfig: TCommandLineConfig;
+  lMeta: TTranscriptMetadata;
+  lOutputPath, lStartedUtc, lStatus: string;
+  lStats: TChannelRunStats;
+  lProcessed, lSkipped, lFailed, lDeferred, lChannelResult: Integer;
+begin
+  Result := 1;
+  lJob := TDownloadFile.Open(aFileName);
   try
     TryAutoUpdateYtDlp;
+    GThrottleController := TThrottleController.Create(1);
+    try
+      lStartedUtc := UtcNowIso;
+      lProcessed := 0;
+      lSkipped := 0;
+      lFailed := 0;
+      lDeferred := 0;
+      UpdateJobState(lJob, 'running', lStartedUtc, 0, 0, 0, 0, False);
+      lJob.Checkpoint;
+      lEntries := lJob.Entries;
+      for lEntry in lEntries do
+      begin
+        if not lJob.IsEligible(lEntry) then
+        begin
+          Inc(lSkipped);
+          Continue;
+        end;
+        lConfig := Default(TCommandLineConfig);
+        LoadDefaultOptions(lConfig);
+        ApplyEntryConfig(lConfig, lJob, lEntry);
+        if (lEntry.Kind = dekVideo) and
+           FindExistingStandaloneOutput(lConfig.OutputDir, lEntry.Url, lOutputPath) then
+        begin
+          WriteLn('Already downloaded; removing queue entry: ' + lEntry.Url);
+          lJob.RemoveStandaloneVideoByUrl(lEntry.GroupIndex, lEntry.Url);
+          Inc(lProcessed);
+          UpdateJobState(lJob, 'running', lStartedUtc, lProcessed, lSkipped,
+            lFailed, lDeferred, False);
+          lJob.Checkpoint;
+          Continue;
+        end;
+        MarkEntryAttempt(lEntry);
+        UpdateJobState(lJob, 'running', lStartedUtc, lProcessed, lSkipped,
+          lFailed, lDeferred, False);
+        lJob.Checkpoint;
+        lMeta := Default(TTranscriptMetadata);
+        try
+          if lEntry.Kind = dekChannel then
+          begin
+            lChannelResult := RunChannelMode(lConfig, lStats);
+            if lChannelResult = 2 then
+              raise Exception.Create('YouTube throttling persisted; channel processing was deferred');
+            MarkChannelSuccess(lEntry, lStats);
+          end
+          else
+          begin
+            RunSingleVideoWithRetries(lConfig, lMeta, lOutputPath);
+            if (not TFile.Exists(lOutputPath)) or
+               (not SameText(Trim(ReadFrontMatterValue(lOutputPath, 'video_id')),
+                 Trim(lMeta.VideoId))) then
+              raise Exception.Create('Downloaded output could not be verified by video_id');
+            lJob.RemoveStandaloneVideoByUrl(lEntry.GroupIndex, lEntry.Url);
+          end;
+          Inc(lProcessed);
+        except
+          on E: Exception do
+          begin
+            Inc(lFailed);
+            MarkEntryFailure(lEntry, E.Message, lMeta);
+            WriteLn(Format('Warning: retained %s (%s)', [lEntry.Url, E.Message]));
+            if IsThrottleError(E.Message) or
+               (Assigned(GThrottleController) and GThrottleController.IsTerminal) then
+            begin
+              lDeferred := Length(lEntries) - lProcessed - lSkipped - lFailed;
+              if lDeferred < 0 then lDeferred := 0;
+              UpdateJobState(lJob, 'throttled', lStartedUtc, lProcessed,
+                lSkipped, lFailed, lDeferred, True);
+              lJob.Checkpoint;
+              Exit(2);
+            end;
+          end;
+        end;
+        UpdateJobState(lJob, 'running', lStartedUtc, lProcessed, lSkipped,
+          lFailed, lDeferred, False);
+        lJob.Checkpoint;
+      end;
+      if lFailed > 0 then lStatus := 'completed_with_errors'
+      else lStatus := 'completed';
+      UpdateJobState(lJob, lStatus, lStartedUtc, lProcessed, lSkipped,
+        lFailed, lDeferred, True);
+      lJob.Checkpoint;
+      WriteLn(Format('YAML job completed: processed=%d skipped=%d failed=%d deferred=%d',
+        [lProcessed, lSkipped, lFailed, lDeferred]));
+      Result := 0;
+    finally
+      FreeAndNil(GThrottleController);
+    end;
+  finally
+    lJob.Free;
+  end;
+end;
+
+function Run: Integer;
+var
+  lConfig: TCommandLineConfig;
+  lMeta: TTranscriptMetadata;
+  lOutputPath: string;
+  lStats: TChannelRunStats;
+begin
+  Result := 1;
+  try
     lConfig := ParseCommandLine;
 
     if lConfig.ShowHelp then
@@ -1534,36 +1948,22 @@ begin
       Exit(0);
     end;
 
+    if not lConfig.DownloadFileName.IsEmpty then
+      Exit(RunDownloadFile(lConfig.DownloadFileName));
+
+    TryAutoUpdateYtDlp;
     if lConfig.URL.IsEmpty then
       raise EArgumentException.Create('YouTube URL is a required argument.');
 
-    if lConfig.ChannelMode then
-      Exit(RunChannelMode(lConfig));
-
-    lYtDlpExtraArgs := BuildYtDlpAuthArguments(lConfig);
-    gc(lService, TTranscriptService.Create);
-    lResult := lService.FetchTranscript(lConfig.URL, lConfig.Language, lYtDlpExtraArgs);
-    lOutputText := lResult.Transcript;
-    lMetaOptions := lConfig.MetaOptions;
-    if lConfig.IncludeMeta then
-      lOutputText := BuildMetaSection(lResult.Meta, lConfig.Keywords, lMetaOptions) + lOutputText;
-
-    lConfig.OutputTarget := BuildOutputFilePath(lConfig, lResult.Meta);
-    if lConfig.OutputTarget.IsEmpty then
-    begin
-      WriteLn(lOutputText);
-    end
-    else
-    begin
-      lConfig.OutputTarget := EnsureUniqueFilePath(lConfig.OutputTarget);
-      lOutputDir := ExtractFileDir(lConfig.OutputTarget);
-      if not lOutputDir.IsEmpty then
-        TDirectory.CreateDirectory(lOutputDir);
-      TFile.WriteAllText(lConfig.OutputTarget, lOutputText, TEncoding.UTF8);
-      WriteLn('Transcript saved to: ', lConfig.OutputTarget);
+    GThrottleController := TThrottleController.Create(lConfig.Jobs);
+    try
+      if lConfig.ChannelMode then
+        Result := RunChannelMode(lConfig, lStats)
+      else
+        Result := RunSingleVideo(lConfig, lMeta, lOutputPath);
+    finally
+      FreeAndNil(GThrottleController);
     end;
-
-    Result := 0;
   except
     on E: Exception do
     begin
@@ -1596,6 +1996,13 @@ begin
     begin
       Result.ShowHelp := True;
       Exit; // Short-circuit for help
+    end
+    else if (lArg = '-f') or (lArg = '--file') then
+    begin
+      if (x + 1) > ParamCount then
+        raise EArgumentException.CreateFmt('Missing value for option %s', [lArg]);
+      Inc(x);
+      Result.DownloadFileName := ParamStr(x);
     end
     else if (lArg = '-o') or (lArg = '--output') then
     begin
@@ -1712,6 +2119,8 @@ begin
 
   if Result.Language = '' then
     Result.Language := CDefaultLanguage;
+  if (Result.DownloadFileName <> '') and (ParamCount <> 2) then
+    raise EArgumentException.Create('--file/-f cannot be combined with a URL or URL-specific options.');
   if Result.Jobs < 1 then
     Result.Jobs := GetDefaultJobCount;
   if lCookiesFileProvided and lCookiesBrowserProvided then
@@ -1902,6 +2311,8 @@ var
   lStdOut: TStringBuilder;
   lStdErr: TStringBuilder;
 begin
+  if Assigned(GThrottleController) then
+    GThrottleController.BeforeRequest;
   lCmd := Format('"%s" %s', [GetYtDlpPath, aArguments]);
   lStdOut := TStringBuilder.Create;
   lStdErr := TStringBuilder.Create;
@@ -1922,6 +2333,8 @@ begin
     );
     aOutput := lStdOut.ToString;
     aError := lStdErr.ToString;
+    if Assigned(GThrottleController) then
+      GThrottleController.ReportResult(Result, aOutput + sLineBreak + aError);
   finally
     lStdErr.Free;
     lStdOut.Free;
@@ -1954,7 +2367,11 @@ var
   lCommandArgs: string;
 begin
   Result := Default(TTranscriptMetadata);
-  lCommandArgs := '--dump-single-json --quiet --no-warnings --skip-download --no-playlist ';
+  lCommandArgs := '--dump-single-json --quiet --no-warnings --skip-download ';
+  if ExtractVideoIdFromUrl(aUrl) <> '' then
+    lCommandArgs := lCommandArgs + '--no-playlist '
+  else
+    lCommandArgs := lCommandArgs + '--playlist-items 0 ';
   if Trim(aYtDlpExtraArgs) <> '' then
     lCommandArgs := lCommandArgs + Trim(aYtDlpExtraArgs) + ' ';
   lCommandArgs := lCommandArgs + Format('"%s"', [aUrl]);
@@ -2120,6 +2537,8 @@ begin
     lStdErr := TStringBuilder.Create;
     lStdOut := TStringBuilder.Create;
     try
+      if Assigned(GThrottleController) then
+        GThrottleController.BeforeRequest;
       MaxLogic.ioutils.ExecuteFile(
         lCmd,
         '',
@@ -2134,6 +2553,9 @@ begin
         end,
         True
       );
+      if Assigned(GThrottleController) then
+        GThrottleController.ReportResult(lExitCode,
+          lStdOut.ToString + sLineBreak + lStdErr.ToString);
     finally
       if lExitCode <> 0 then
       begin

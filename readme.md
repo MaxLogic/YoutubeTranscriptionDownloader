@@ -12,7 +12,7 @@ yttrans acts as a lightweight wrapper around the powerful `yt-dlp` engine, focus
 *   **Language Selection:** Specify the desired transcript language (e.g., `en`, `pl`, `de`).
 *   **Flexible Output:** Print the transcript directly to the console or save it to a text file.
 *   **Channel Mode:** Start from one video URL and download transcripts for the whole channel.
-*   **YAML Download Queue (planned):** Process grouped channels and videos as one throttled job while retaining failures for later runs.
+*   **YAML Download Queue:** Process grouped channels and videos as one throttled job while retaining failures for later runs.
 *   **Authenticated Access:** Optional cookie-based authentication for YouTube requests.
 *   **Parallel Processing:** Channel mode supports worker parallelism (`-j`) with retry/backoff on transient failures.
 *   **Clean Text:** Automatically parses the SRT subtitle format into clean, readable plain text.
@@ -164,9 +164,9 @@ yttrans "https://www.youtube.com/watch?v=VIDEO_ID" -c --cookies-from-browser chr
 yttrans "https://www.youtube.com/watch?v=VIDEO_ID" -c --retry-unavailable
 ```
 
-### YAML Download File Mode (planned)
+### YAML Download File Mode
 
-The accepted file-mode design replaces a list of separate batch commands with one coordinated queue:
+File mode replaces a list of separate batch commands with one coordinated queue:
 
 ```bash
 yttrans --file download.yaml
@@ -202,7 +202,7 @@ The top-level modes are:
 
 Successfully downloaded standalone video entries are removed from the YAML file. Channel entries remain so later runs can discover new uploads. Failures retain their error category, message, attempt timestamp, and available YouTube metadata. One shared throttle controller applies across the complete file.
 
-File mode is specified in [`docs/specs/2026-08-30-yaml-download-file-mode-spec.md`](docs/specs/2026-08-30-yaml-download-file-mode-spec.md). The current executable does not support `--file` until that implementation is completed.
+The queue is locked while running and checkpointed through a backup plus atomic replacement after each attempted entry. If another editor changes the YAML file during a run, yttrans refuses to overwrite that edit. The complete schema is specified in [`docs/specs/2026-08-30-yaml-download-file-mode-spec.md`](docs/specs/2026-08-30-yaml-download-file-mode-spec.md).
 
 ### Command-Line Arguments & Options
 
@@ -210,7 +210,8 @@ Use `yttrans` for these options. `-meta` is not a `yt-dlp` flag.
 
 | Argument / Option | Alias        | Description                                                                                             |
 | ----------------- | ------------ | ------------------------------------------------------------------------------------------------------- |
-| `<URL>`           |              | The full URL of the YouTube video. This is a **required** argument.                                     |
+| `<URL>`           |              | The YouTube video or channel seed URL used by direct mode.                                              |
+| `-f`, `--file`    |              | Process a mutable YAML queue. Cannot be combined with a URL or direct-mode options.                     |
 | `-l`, `--lang`    |              | The language code for the subtitles (e.g., `en`, `pl`). Defaults to `en` if not specified.                |
 | `-o`, `--output`  |              | Video mode: output file path or directory. Channel mode: root output directory for `<channel-name>/` files. |
 | `-p`, `--prefix`  |              | Prefix for auto-generated file names. Separator comes from `settings.ini` key `default.prefix_separator`. |
@@ -235,11 +236,12 @@ Use `yttrans` for these options. `-meta` is not a `yt-dlp` flag.
 *   Channel mode always writes metadata front matter and enforces `channel` + `video_id` fields for dedup/overwrite logic.
 *   File naming in channel mode is title-based (`<title>.md`), with conflict probing (`<title> (2).md`, ...) when title collisions refer to different `video_id`s.
 *   Existing file with same `video_id` is skipped by default; use `-ov` to overwrite.
-*   Videos without subtitles are saved in `<channel>/.yttrans-unavailable.json` with their URL, title, last-attempt UTC timestamp, and published timestamp when available.
-*   Saved unavailable videos are skipped without contacting YouTube. Use `--retry-unavailable` to try them again. Successful retries remove their manifest entries.
+*   Failed channel children are saved in `<channel>/.yttrans-unavailable.json` with status, error category, URL, title, last-attempt UTC timestamp, and published timestamp when available. Existing schema-1 unavailable caches are migrated when saved.
+*   Cached failures are skipped without contacting YouTube. Use `--retry-unavailable` in direct mode, or YAML mode `failed`/`all`, to try them again. Successful retries remove their manifest entries.
 *   Requested subtitle language is tried first, then fallback to default language (`en`) when that language is unavailable.
 *   Processing is best-effort: failed videos are reported as warnings and do not stop the whole channel run.
 *   On HTTP 429 or another throttling signal, the tool reduces active concurrency to one and waits about 30 seconds, 2 minutes, then 5 minutes. Persistent throttling stops the channel and reports unprocessed videos as deferred.
+*   YAML file mode shares that cooldown across every channel and standalone video in the queue. A terminal throttle is checkpointed and stops the job; a later `fresh` run skips the retained item, while `failed` or `all` retries it.
 
 ### Anti-Bot Guidance
 

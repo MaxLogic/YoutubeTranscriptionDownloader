@@ -1,0 +1,14 @@
+schema: 1
+mode: fresh
+
+defaults:
+  language: en
+  output_dir: output
+  jobs: 1
+  delay_jitter_ms: 1200
+
+groups:
+  - name: MaxLogic live smoke test
+    subfolder: MaxLogic
+    videos:
+      - url: https://www.youtube.com/watch?v=lRQae-tRw-k

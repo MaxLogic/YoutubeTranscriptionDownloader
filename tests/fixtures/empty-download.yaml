@@ -1,0 +1,9 @@
+# Empty queues are valid and still receive a run summary.
+schema: 1
+mode: fresh # edit this mode
+
+defaults:
+  output_dir: output
+  jobs: 1
+
+groups: []
