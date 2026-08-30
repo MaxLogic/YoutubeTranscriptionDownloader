@@ -2402,7 +2402,7 @@ var
   lCommandArgs: string;
 begin
   Result := Default(TTranscriptMetadata);
-  lCommandArgs := '--dump-single-json --quiet --no-warnings --skip-download ';
+  lCommandArgs := '--dump-single-json --quiet --no-warnings --skip-download --ignore-no-formats-error ';
   if ExtractVideoIdFromUrl(aUrl) <> '' then
     lCommandArgs := lCommandArgs + '--no-playlist '
   else
@@ -2469,7 +2469,7 @@ var
   lVideoId: string;
   lList: TList<string>;
 begin
-  lCommandArgs := '--flat-playlist --dump-single-json --quiet --no-warnings --skip-download ';
+  lCommandArgs := '--flat-playlist --dump-single-json --quiet --no-warnings --skip-download --ignore-no-formats-error ';
   if Trim(aYtDlpExtraArgs) <> '' then
     lCommandArgs := lCommandArgs + Trim(aYtDlpExtraArgs) + ' ';
   lCommandArgs := lCommandArgs + Format('"%s"', [aListUrl]);
@@ -2559,6 +2559,7 @@ begin
     lParams.Append('--write-auto-sub ');
     lParams.Append('--sub-format srt ');
     lParams.AppendFormat('--sub-lang %s ', [aLanguage]);
+    lParams.Append('--ignore-no-formats-error ');
     lParams.Append('--write-info-json ');
     if Trim(aYtDlpExtraArgs) <> '' then
       lParams.Append(Trim(aYtDlpExtraArgs) + ' ');
