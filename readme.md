@@ -157,6 +157,12 @@ yttrans "https://www.youtube.com/watch?v=VIDEO_ID" -c -o "C:\Transcripts\" -j 8 
 yttrans "https://www.youtube.com/watch?v=VIDEO_ID" -c --cookies-from-browser chrome
 ```
 
+**11. Retry videos previously recorded without a transcript:**
+
+```bash
+yttrans "https://www.youtube.com/watch?v=VIDEO_ID" -c --retry-unavailable
+```
+
 ### Command-Line Arguments & Options
 
 Use `yttrans` for these options. `-meta` is not a `yt-dlp` flag.
@@ -170,7 +176,7 @@ Use `yttrans` for these options. `-meta` is not a `yt-dlp` flag.
 | `-meta`, `--meta` |              | Prepends metadata before transcript text. Individual fields are controlled by `[meta]` switches in `settings.ini`. |
 | `-keywords`       |              | Comma-separated keywords added to metadata section. Automatically enables `-meta`.                      |
 | `-c`, `--channel` |              | Channel mode. Uses the seed video URL to discover the owning channel and download channel transcripts. |
-| `-j`, `--jobs`    |              | Max parallel workers in channel mode. Defaults to `min(logical CPU count, 2)`.                         |
+| `-j`, `--jobs`    |              | Max parallel workers in channel mode. Defaults to `1`.                                                |
 | `-ov`, `--override` |            | Channel mode only. Overwrite file if existing front matter has the same `video_id`.                    |
 | `-co`, `--channel-output` |      | Channel mode only. Override root output directory (same semantics as `-o` in channel mode).           |
 | `-is`, `--include-shorts` |      | Channel mode only. Include videos from Shorts tab (best effort; warns if tab is missing).             |
@@ -178,6 +184,7 @@ Use `yttrans` for these options. `-meta` is not a `yt-dlp` flag.
 | `--cookies`       |              | Use yt-dlp cookies file for authenticated requests. Overrides `settings.ini` defaults.                  |
 | `--cookies-from-browser` |       | Load cookies from a browser/profile (yt-dlp syntax, e.g. `firefox:default-release`, `chrome:Profile 1`). Overrides `settings.ini` default. |
 | `-dj`, `--delay-jitter-ms` |     | Max random per-item delay in milliseconds in channel mode (default `1200`).                            |
+| `-ru`, `--retry-unavailable` |   | Channel mode only. Retry videos recorded in `.yttrans-unavailable.json`.                              |
 | `-h`, `--help`    |              | Displays the help message and exits.                                                                    |
 
 ### Channel Mode Behavior
@@ -187,9 +194,11 @@ Use `yttrans` for these options. `-meta` is not a `yt-dlp` flag.
 *   Channel mode always writes metadata front matter and enforces `channel` + `video_id` fields for dedup/overwrite logic.
 *   File naming in channel mode is title-based (`<title>.md`), with conflict probing (`<title> (2).md`, ...) when title collisions refer to different `video_id`s.
 *   Existing file with same `video_id` is skipped by default; use `-ov` to overwrite.
+*   Videos without subtitles are saved in `<channel>/.yttrans-unavailable.json` with their URL, title, last-attempt UTC timestamp, and published timestamp when available.
+*   Saved unavailable videos are skipped without contacting YouTube. Use `--retry-unavailable` to try them again. Successful retries remove their manifest entries.
 *   Requested subtitle language is tried first, then fallback to default language (`en`) when that language is unavailable.
 *   Processing is best-effort: failed videos are reported as warnings and do not stop the whole channel run.
-*   On repeated throttling/anti-bot signals, the tool increases cooldown delays and can reduce active worker concurrency automatically.
+*   On HTTP 429 or another throttling signal, the tool reduces active concurrency to one and waits about 30 seconds, 2 minutes, then 5 minutes. Persistent throttling stops the channel and reports unprocessed videos as deferred.
 
 ### Anti-Bot Guidance
 
@@ -197,10 +206,11 @@ Use `yttrans` for these options. `-meta` is not a `yt-dlp` flag.
     *   `--cookies-from-browser <browser>` when running on your own machine profile.
     *   `--cookies <file>` when using an exported cookies file.
 *   Keep concurrency conservative unless needed:
-    *   default is `min(logical CPU, 2)`;
+    *   default is `1`;
     *   raise with `-j` only when the channel is stable and not rate-limited.
 *   Keep pacing enabled:
     *   default per-item jitter is `1200ms`;
     *   tune with `--delay-jitter-ms` if needed.
 *   If YouTube challenges requests, rerun with cookies first before increasing worker count.
+*   YouTube does not publish a fixed wait that clears website rate limiting. The [yt-dlp 429 guidance](https://github.com/yt-dlp/yt-dlp/wiki/FAQ#http-error-429-too-many-requests-or-402-payment-required) describes it as an IP soft block that may require solving a CAPTCHA and passing matching browser cookies.
 

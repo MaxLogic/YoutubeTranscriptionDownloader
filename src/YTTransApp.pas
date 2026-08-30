@@ -44,6 +44,7 @@ type
     CookiesFile: String;
     CookiesFromBrowser: String;
     DelayJitterMs: Integer;
+    RetryUnavailable: Boolean;
   end;
 
   TTranscriptMetadata = record
@@ -63,6 +64,7 @@ type
     CommentCount: String;
     Tags: String;
     Description: String;
+    PublishedAt: String;
     class function FromJson(const aJson: string): TTranscriptMetadata; static;
     function HasData: Boolean;
   end;
@@ -91,7 +93,8 @@ implementation
 
 uses
   System.IOUtils, System.IniFiles, System.JSON, System.StrUtils, System.DateUtils,
-  System.SyncObjs, System.Threading, System.Generics.Collections, autoFree, MaxLogic.ioUtils;
+  System.SyncObjs, System.Threading, System.Generics.Collections, Winapi.Windows,
+  autoFree, MaxLogic.ioUtils;
 
 resourcestring
   RSUsage =
@@ -109,7 +112,7 @@ resourcestring
     '  -meta, --meta           Prepend YouTube metadata before the transcript output.' + sLineBreak +
     '  -keywords <list>         Comma-separated keywords added to metadata. Implies -meta.' + sLineBreak +
     '  -c, --channel           Download all videos from the channel owning <URL>.' + sLineBreak +
-    '  -j, --jobs <n>          Parallel workers in channel mode. Default: min(logical CPU, 2).' + sLineBreak +
+    '  -j, --jobs <n>          Parallel workers in channel mode. Default: 1.' + sLineBreak +
     '  -ov, --override         In channel mode, overwrite existing file with the same video_id.' + sLineBreak +
     '  -co, --channel-output <dir>  Root output directory override for channel mode.' + sLineBreak +
     '  -is, --include-shorts   In channel mode, include Shorts tab.' + sLineBreak +
@@ -118,6 +121,7 @@ resourcestring
     '  --cookies-from-browser <browser>  Load cookies from browser profile (yt-dlp syntax).' + sLineBreak +
     '                            Defaults can be set in settings.ini [default] cookies_file/cookies_from_browser.' + sLineBreak +
     '  -dj, --delay-jitter-ms <n>  Max per-item jitter delay in ms for channel mode pacing.' + sLineBreak +
+    '  -ru, --retry-unavailable  Retry videos recorded as having no transcript.' + sLineBreak +
     '  -h, --help              Show this help and exit.' + sLineBreak;
 
   RSError = 'Error: %s';
@@ -136,12 +140,14 @@ const
   CDefaultCookiesFromBrowserKey = 'cookies_from_browser';
   CMetaSection = 'meta';
   CDefaultLanguage = 'en';
-  CRetryAttempts = 3;
+  CUnavailableManifestFileName = '.yttrans-unavailable.json';
+  CUnavailableManifestSchema = 1;
+  CRetryAttempts = 4;
   CRetryBaseDelayMs = 600;
-  CThrottleCooldownMs = 3000;
-  CMaxThrottleCooldownMs = 60000;
+  CThrottleRetryDelaysMs: array[1..3] of Integer = (30000, 120000, 300000);
+  CMaxThrottleCooldownMs = 300000;
   CDefaultDelayJitterMs = 1200;
-  CDefaultChannelJobsCap = 2;
+  CDefaultChannelJobsCap = 1;
 
 type
   TChannelConflictAction = (ccaWriteNew, ccaOverwrite, ccaSkip);
@@ -151,8 +157,192 @@ type
     Overwritten: Integer;
     Skipped: Integer;
     Unavailable: Integer;
+    UnavailableCached: Integer;
     Failed: Integer;
   end;
+
+  TUnavailableVideo = record
+    VideoId: string;
+    Url: string;
+    Title: string;
+    PublishedAt: string;
+    LastAttemptUtc: string;
+  end;
+
+  TUnavailableVideoMap = TDictionary<string, TUnavailableVideo>;
+
+  EMissingTranscriptError = class(EFileNotFoundException)
+  private
+    FMetadata: TTranscriptMetadata;
+  public
+    constructor Create(const aMessage: string; const aMetadata: TTranscriptMetadata);
+    property Metadata: TTranscriptMetadata read FMetadata;
+  end;
+
+constructor EMissingTranscriptError.Create(
+  const aMessage: string;
+  const aMetadata: TTranscriptMetadata);
+begin
+  inherited Create(aMessage);
+  FMetadata := aMetadata;
+end;
+
+function GetThrottleRetryDelayMs(const aAttempt: Integer): Integer;
+var
+  lIndex: Integer;
+begin
+  lIndex := aAttempt;
+  if lIndex < Low(CThrottleRetryDelaysMs) then
+    lIndex := Low(CThrottleRetryDelaysMs)
+  else if lIndex > High(CThrottleRetryDelaysMs) then
+    lIndex := High(CThrottleRetryDelaysMs);
+  Result := CThrottleRetryDelaysMs[lIndex];
+  if Result > CMaxThrottleCooldownMs then
+    Result := CMaxThrottleCooldownMs;
+end;
+
+function UtcNowIso: string;
+begin
+  Result := DateToISO8601(TTimeZone.Local.ToUniversalTime(Now), True);
+end;
+
+function JsonText(const aObject: TJSONObject; const aName: string): string;
+var
+  lValue: TJSONValue;
+begin
+  Result := '';
+  if not Assigned(aObject) then
+    Exit;
+  lValue := aObject.Values[aName];
+  if Assigned(lValue) then
+    Result := lValue.Value;
+end;
+
+function GetUnavailableManifestPath(const aChannelDir: string): string;
+begin
+  Result := TPath.Combine(aChannelDir, CUnavailableManifestFileName);
+end;
+
+function LoadUnavailableVideos(const aChannelDir: string): TUnavailableVideoMap;
+var
+  lManifestPath: string;
+  lJsonText: string;
+  lJsonValue: TJSONValue;
+  lRoot: TJSONObject;
+  lVideosValue: TJSONValue;
+  lVideos: TJSONArray;
+  lItem: TJSONObject;
+  lEntry: TUnavailableVideo;
+  lSchema: Integer;
+begin
+  Result := TUnavailableVideoMap.Create;
+  try
+    lManifestPath := GetUnavailableManifestPath(aChannelDir);
+    if not TFile.Exists(lManifestPath) then
+      Exit;
+
+    try
+      lJsonText := TFile.ReadAllText(lManifestPath, TEncoding.UTF8);
+    except
+      lJsonText := TFile.ReadAllText(lManifestPath, TEncoding.Default);
+    end;
+
+    lJsonValue := TJSONObject.ParseJSONValue(lJsonText, False, True);
+    if not (lJsonValue is TJSONObject) then
+    begin
+      lJsonValue.Free;
+      raise EConvertError.CreateFmt('Invalid unavailable-video manifest: %s', [lManifestPath]);
+    end;
+
+    lRoot := TJSONObject(lJsonValue);
+    try
+      lSchema := StrToIntDef(JsonText(lRoot, 'schema'), -1);
+      if lSchema <> CUnavailableManifestSchema then
+        raise EConvertError.CreateFmt(
+          'Unsupported unavailable-video manifest schema %d in %s',
+          [lSchema, lManifestPath]
+        );
+
+      lVideosValue := lRoot.Values['videos'];
+      if not (lVideosValue is TJSONArray) then
+        raise EConvertError.CreateFmt('Unavailable-video manifest has no videos array: %s', [lManifestPath]);
+
+      lVideos := TJSONArray(lVideosValue);
+      for var lIndex := 0 to lVideos.Count - 1 do
+      begin
+        if not (lVideos.Items[lIndex] is TJSONObject) then
+          raise EConvertError.CreateFmt('Unavailable-video manifest contains an invalid entry: %s', [lManifestPath]);
+        lItem := TJSONObject(lVideos.Items[lIndex]);
+        lEntry := Default(TUnavailableVideo);
+        lEntry.VideoId := Trim(JsonText(lItem, 'video_id'));
+        if lEntry.VideoId = '' then
+          raise EConvertError.CreateFmt('Unavailable-video manifest entry has no video_id: %s', [lManifestPath]);
+        lEntry.Url := JsonText(lItem, 'url');
+        lEntry.Title := JsonText(lItem, 'title');
+        lEntry.PublishedAt := JsonText(lItem, 'published_at');
+        lEntry.LastAttemptUtc := JsonText(lItem, 'last_attempt_utc');
+        Result.AddOrSetValue(lEntry.VideoId.ToLower, lEntry);
+      end;
+    finally
+      lRoot.Free;
+    end;
+  except
+    Result.Free;
+    raise;
+  end;
+end;
+
+procedure SaveUnavailableVideos(
+  const aChannelDir: string;
+  const aVideos: TUnavailableVideoMap);
+var
+  lManifestPath: string;
+  lTempPath: string;
+  lRoot: TJSONObject;
+  lArray: TJSONArray;
+  lItem: TJSONObject;
+  lKeys: TStringList;
+  lEntry: TUnavailableVideo;
+begin
+  lManifestPath := GetUnavailableManifestPath(aChannelDir);
+  lTempPath := lManifestPath + '.' + TPath.GetGUIDFileName + '.tmp';
+  lRoot := TJSONObject.Create;
+  lKeys := TStringList.Create;
+  try
+    lRoot.AddPair('schema', TJSONNumber.Create(CUnavailableManifestSchema));
+    lArray := TJSONArray.Create;
+    lRoot.AddPair('videos', lArray);
+
+    for var lKey in aVideos.Keys do
+      lKeys.Add(lKey);
+    lKeys.Sort;
+
+    for var lKey in lKeys do
+    begin
+      lEntry := aVideos[lKey];
+      lItem := TJSONObject.Create;
+      lItem.AddPair('video_id', lEntry.VideoId);
+      lItem.AddPair('url', lEntry.Url);
+      lItem.AddPair('title', lEntry.Title);
+      lItem.AddPair('published_at', lEntry.PublishedAt);
+      lItem.AddPair('last_attempt_utc', lEntry.LastAttemptUtc);
+      lArray.AddElement(lItem);
+    end;
+
+    TFile.WriteAllText(lTempPath, lRoot.Format(2), TEncoding.UTF8);
+    if not MoveFileEx(
+      PChar(lTempPath),
+      PChar(lManifestPath),
+      MOVEFILE_REPLACE_EXISTING or MOVEFILE_WRITE_THROUGH
+    ) then
+      RaiseLastOSError;
+  finally
+    if TFile.Exists(lTempPath) then
+      TFile.Delete(lTempPath);
+    lKeys.Free;
+    lRoot.Free;
+  end;
+end;
 
 function ParseBoolLike(const aValue: string; const aDefault: Boolean): Boolean;
 var
@@ -971,8 +1161,12 @@ var
   lYtDlpExtraArgs: string;
   lActiveWorkers: Integer;
   lWorkerLimit: Integer;
-  lThrottleScore: Integer;
+  lStopScheduling: Integer;
   lExistingVideoIds: TDictionary<string, Byte>;
+  lUnavailableVideos: TUnavailableVideoMap;
+  lUnavailableManifestChanged: Boolean;
+  lProcessedCount: Integer;
+  lDeferredCount: Integer;
 begin
   Result := 1;
 
@@ -986,27 +1180,40 @@ begin
   lChannelDir := BuildChannelOutputDir(aConfig, lSeedMeta);
   TDirectory.CreateDirectory(lChannelDir);
 
-  lExistingVideoIds := TDictionary<string, Byte>.Create;
-  for var lExistingFile in TDirectory.GetFiles(lChannelDir, '*.md', TSearchOption.soTopDirectoryOnly) do
-  begin
-    var lExistingVideoId := Trim(ReadFrontMatterValue(lExistingFile, 'video_id')).ToLower;
-    if (lExistingVideoId <> '') and (not lExistingVideoIds.ContainsKey(lExistingVideoId)) then
-      lExistingVideoIds.Add(lExistingVideoId, 1);
-  end;
-
-  lEffectiveMetaOptions := aConfig.MetaOptions;
-  lEffectiveMetaOptions.Channel := True;
-  lEffectiveMetaOptions.VideoId := True;
-  lEffectiveMetaOptions.ChannelId := True;
-
-  lFileLock := TCriticalSection.Create;
-  lLogLock := TCriticalSection.Create;
+  lExistingVideoIds := nil;
+  lUnavailableVideos := nil;
+  lFileLock := nil;
+  lLogLock := nil;
   try
+    lExistingVideoIds := TDictionary<string, Byte>.Create;
+    lUnavailableVideos := LoadUnavailableVideos(lChannelDir);
+    lUnavailableManifestChanged := False;
+    for var lExistingFile in TDirectory.GetFiles(lChannelDir, '*.md', TSearchOption.soTopDirectoryOnly) do
+    begin
+      var lExistingVideoId := Trim(ReadFrontMatterValue(lExistingFile, 'video_id')).ToLower;
+      if (lExistingVideoId <> '') and (not lExistingVideoIds.ContainsKey(lExistingVideoId)) then
+        lExistingVideoIds.Add(lExistingVideoId, 1);
+      if (lExistingVideoId <> '') and lUnavailableVideos.ContainsKey(lExistingVideoId) then
+      begin
+        lUnavailableVideos.Remove(lExistingVideoId);
+        lUnavailableManifestChanged := True;
+      end;
+    end;
+    if lUnavailableManifestChanged then
+      SaveUnavailableVideos(lChannelDir, lUnavailableVideos);
+
+    lEffectiveMetaOptions := aConfig.MetaOptions;
+    lEffectiveMetaOptions.Channel := True;
+    lEffectiveMetaOptions.VideoId := True;
+    lEffectiveMetaOptions.ChannelId := True;
+
+    lFileLock := TCriticalSection.Create;
+    lLogLock := TCriticalSection.Create;
     lNextIndex := -1;
     lCooldownUntil := 0;
     lStats := Default(TChannelRunStats);
     lActiveWorkers := 0;
-    lThrottleScore := 0;
+    lStopScheduling := 0;
 
     lWorkerCount := aConfig.Jobs;
     if lWorkerCount < 1 then
@@ -1038,19 +1245,22 @@ begin
           lFailedMessage: string;
           lActiveSnapshot: Integer;
           lLimitSnapshot: Integer;
-          lNextLimit: Integer;
-          lThrottleValue: Integer;
-          lDelayFloor: Integer;
           lJitterMs: Integer;
           lUnavailable: Boolean;
           lVideoId: string;
           lAlreadyExists: Boolean;
+          lCachedUnavailable: Boolean;
+          lUnavailableMeta: TTranscriptMetadata;
+          lUnavailableEntry: TUnavailableVideo;
+          lIsThrottle: Boolean;
         begin
           Sleep(lWorkerIdx * 150);
           lService := TTranscriptService.Create;
           try
             while True do
             begin
+              if TInterlocked.Add(lStopScheduling, 0) <> 0 then
+                Break;
               lIndex := TInterlocked.Increment(lNextIndex);
               if lIndex >= Length(lVideoUrls) then
                 Break;
@@ -1071,6 +1281,22 @@ begin
                 end;
               end;
 
+              if not aConfig.RetryUnavailable then
+              begin
+                lVideoId := ExtractVideoIdFromUrl(lVideoUrls[lIndex]).ToLower;
+                lFileLock.Enter;
+                try
+                  lCachedUnavailable := (lVideoId <> '') and lUnavailableVideos.ContainsKey(lVideoId);
+                finally
+                  lFileLock.Leave;
+                end;
+                if lCachedUnavailable then
+                begin
+                  TInterlocked.Increment(lStats.UnavailableCached);
+                  Continue;
+                end;
+              end;
+
               while True do
               begin
                 lLimitSnapshot := TInterlocked.Add(lWorkerLimit, 0);
@@ -1086,8 +1312,10 @@ begin
               try
                 lFailedMessage := '';
                 lUnavailable := False;
+                lUnavailableMeta := Default(TTranscriptMetadata);
                 for lAttempt := 1 to CRetryAttempts do
                 begin
+                  lDelayMs := 0;
                   while True do
                   begin
                     lWaitUntil := TInterlocked.Read(lCooldownUntil);
@@ -1123,12 +1351,16 @@ begin
                         else
                           TInterlocked.Increment(lStats.Downloaded);
                       end;
+                      lVideoId := Trim(lResult.Meta.VideoId).ToLower;
+                      if (lVideoId <> '') and lUnavailableVideos.ContainsKey(lVideoId) then
+                      begin
+                        lUnavailableVideos.Remove(lVideoId);
+                        SaveUnavailableVideos(lChannelDir, lUnavailableVideos);
+                      end;
                     finally
                       lFileLock.Leave;
                     end;
 
-                    if TInterlocked.Add(lThrottleScore, 0) > 0 then
-                      TInterlocked.Decrement(lThrottleScore);
                     lFailedMessage := '';
                     Break;
                   except
@@ -1138,21 +1370,32 @@ begin
                       if IsMissingSubtitleError(lFailedMessage) then
                       begin
                         lUnavailable := True;
+                        if E is EMissingTranscriptError then
+                          lUnavailableMeta := EMissingTranscriptError(E).Metadata;
                         Break;
                       end;
-                      if lAttempt = CRetryAttempts then
-                        Break;
-
-                      lDelayMs := CRetryBaseDelayMs * (1 shl (lAttempt - 1));
-                      lDelayMs := lDelayMs + ((lIndex + lAttempt * 53) mod 350);
-                      if IsThrottleError(E.Message) then
+                      lIsThrottle := IsThrottleError(lFailedMessage);
+                      if lIsThrottle then
                       begin
-                        lThrottleValue := TInterlocked.Increment(lThrottleScore);
-                        lDelayFloor := CThrottleCooldownMs * lAttempt * lThrottleValue;
-                        if lDelayFloor > CMaxThrottleCooldownMs then
-                          lDelayFloor := CMaxThrottleCooldownMs;
-                        if lDelayMs < lDelayFloor then
-                          lDelayMs := lDelayFloor;
+                        if lAttempt = CRetryAttempts then
+                        begin
+                          if TInterlocked.CompareExchange(lStopScheduling, 1, 0) = 0 then
+                          begin
+                            lLogLock.Enter;
+                            try
+                              WriteLn(Format(
+                                'Warning: throttling persisted after %d attempts; stopping this channel with remaining videos deferred.',
+                                [CRetryAttempts]
+                              ));
+                            finally
+                              lLogLock.Leave;
+                            end;
+                          end;
+                          Break;
+                        end;
+
+                        lDelayMs := GetThrottleRetryDelayMs(lAttempt);
+                        lDelayMs := lDelayMs + ((lIndex + lAttempt * 997) mod 5001);
 
                         lNow := TThread.GetTickCount64;
                         lWaitUntil := lNow + lDelayMs;
@@ -1162,23 +1405,23 @@ begin
                             Break;
                         until TInterlocked.CompareExchange(lCooldownUntil, lWaitUntil, lObserved) = lObserved;
 
-                        while True do
+                        lLimitSnapshot := TInterlocked.Exchange(lWorkerLimit, 1);
+                        if lLimitSnapshot > 1 then
                         begin
-                          lLimitSnapshot := TInterlocked.Add(lWorkerLimit, 0);
-                          if lLimitSnapshot <= 1 then
-                            Break;
-                          lNextLimit := lLimitSnapshot - 1;
-                          if TInterlocked.CompareExchange(lWorkerLimit, lNextLimit, lLimitSnapshot) = lLimitSnapshot then
-                          begin
-                            lLogLock.Enter;
-                            try
-                              WriteLn(Format('Warning: throttling detected, reducing active workers to %d', [lNextLimit]));
-                            finally
-                              lLogLock.Leave;
-                            end;
-                            Break;
+                          lLogLock.Enter;
+                          try
+                            WriteLn('Warning: throttling detected, reducing active workers to 1');
+                          finally
+                            lLogLock.Leave;
                           end;
                         end;
+                      end;
+                      if not lIsThrottle then
+                      begin
+                        if lAttempt = CRetryAttempts then
+                          Break;
+                        lDelayMs := CRetryBaseDelayMs * (1 shl (lAttempt - 1));
+                        lDelayMs := lDelayMs + ((lIndex + lAttempt * 53) mod 350);
                       end;
                       Sleep(lDelayMs);
                     end;
@@ -1188,7 +1431,27 @@ begin
                 if lFailedMessage <> '' then
                 begin
                   if lUnavailable then
-                    TInterlocked.Increment(lStats.Unavailable)
+                  begin
+                    TInterlocked.Increment(lStats.Unavailable);
+                    lUnavailableEntry := Default(TUnavailableVideo);
+                    lUnavailableEntry.VideoId := Trim(lUnavailableMeta.VideoId);
+                    if lUnavailableEntry.VideoId = '' then
+                      lUnavailableEntry.VideoId := ExtractVideoIdFromUrl(lVideoUrls[lIndex]);
+                    lUnavailableEntry.Url := lVideoUrls[lIndex];
+                    lUnavailableEntry.Title := lUnavailableMeta.Title;
+                    lUnavailableEntry.PublishedAt := lUnavailableMeta.PublishedAt;
+                    lUnavailableEntry.LastAttemptUtc := UtcNowIso;
+                    if lUnavailableEntry.VideoId <> '' then
+                    begin
+                      lFileLock.Enter;
+                      try
+                        lUnavailableVideos.AddOrSetValue(lUnavailableEntry.VideoId.ToLower, lUnavailableEntry);
+                        SaveUnavailableVideos(lChannelDir, lUnavailableVideos);
+                      finally
+                        lFileLock.Leave;
+                      end;
+                    end;
+                  end
                   else
                     TInterlocked.Increment(lStats.Failed);
                   try
@@ -1224,6 +1487,7 @@ begin
     lFileLock.Free;
     lLogLock.Free;
     lExistingVideoIds.Free;
+    lUnavailableVideos.Free;
   end;
 
   WriteLn('Channel download completed.');
@@ -1231,11 +1495,19 @@ begin
   WriteLn('Output: ' + lChannelDir);
   WriteLn(Format('Workers configured: %d', [lWorkerCount]));
   WriteLn(Format('Workers final limit: %d', [TInterlocked.Add(lWorkerLimit, 0)]));
-  WriteLn(Format('Processed: %d', [Length(lVideoUrls)]));
+  lProcessedCount := lStats.Downloaded + lStats.Overwritten + lStats.Skipped +
+    lStats.Unavailable + lStats.UnavailableCached + lStats.Failed;
+  lDeferredCount := Length(lVideoUrls) - lProcessedCount;
+  if lDeferredCount < 0 then
+    lDeferredCount := 0;
+  WriteLn(Format('Queued: %d', [Length(lVideoUrls)]));
+  WriteLn(Format('Processed: %d', [lProcessedCount]));
+  WriteLn(Format('Deferred: %d', [lDeferredCount]));
   WriteLn(Format('Downloaded: %d', [lStats.Downloaded]));
   WriteLn(Format('Overwritten: %d', [lStats.Overwritten]));
   WriteLn(Format('Skipped: %d', [lStats.Skipped]));
   WriteLn(Format('Unavailable: %d', [lStats.Unavailable]));
+  WriteLn(Format('Unavailable cached: %d', [lStats.UnavailableCached]));
   WriteLn(Format('Failed: %d', [lStats.Failed]));
 
   Result := 0;
@@ -1419,6 +1691,10 @@ begin
         raise EArgumentException.CreateFmt('Option %s must be >= 0', [lArg]);
       Result.DelayJitterMs := lJobs;
     end
+    else if (lArg = '-ru') or (lArg = '--retry-unavailable') then
+    begin
+      Result.RetryUnavailable := True;
+    end
     else if StartsText('-', lArg) then
     begin
       raise EArgumentException.CreateFmt('Unknown option: %s', [lArg]);
@@ -1532,6 +1808,16 @@ class function TTranscriptMetadata.FromJson(const aJson: string): TTranscriptMet
     else
       Result := aValue;
   end;
+
+  function FormatEpochDateTime(const aValue: string): string;
+  var
+    lEpoch: Int64;
+  begin
+    if TryStrToInt64(aValue, lEpoch) then
+      Result := DateToISO8601(UnixToDateTime(lEpoch), True)
+    else
+      Result := aValue;
+  end;
 var
   lJsonValue: TJSONValue;
   lJson     : TJSONObject;
@@ -1587,6 +1873,13 @@ begin
       Result.Created := FormatEpochDate(lTemp)
     else if lJson.TryGetValue<string>('timestamp', lTemp) then
       Result.Created := FormatEpochDate(lTemp);
+
+    if lJson.TryGetValue<string>('release_timestamp', lTemp) then
+      Result.PublishedAt := FormatEpochDateTime(lTemp)
+    else if lJson.TryGetValue<string>('timestamp', lTemp) then
+      Result.PublishedAt := FormatEpochDateTime(lTemp)
+    else if lJson.TryGetValue<string>('upload_date', lTemp) then
+      Result.PublishedAt := FormatUploadDate(lTemp);
   finally
     lJson.Free;
   end;
@@ -1598,7 +1891,7 @@ begin
     (VideoId <> '') or (Uploader <> '') or (UploaderId <> '') or (ChannelId <> '') or
     (ChannelUrl <> '') or (UploaderUrl <> '') or
     (Duration <> '') or (ViewCount <> '') or (LikeCount <> '') or (CommentCount <> '') or
-    (Tags <> '') or (Description <> '');
+    (Tags <> '') or (Description <> '') or (PublishedAt <> '');
 end;
 
 { TTranscriptService }
@@ -1674,7 +1967,7 @@ begin
     if (lAttempt >= CRetryAttempts) or (not IsThrottleError(lError)) then
       raise Exception.CreateFmt('yt-dlp metadata fetch failed (exit %d): %s', [lExitCode, Trim(lError)]);
 
-    lDelayMs := CThrottleCooldownMs * lAttempt;
+    lDelayMs := GetThrottleRetryDelayMs(lAttempt);
     Sleep(lDelayMs);
   end;
 
@@ -1737,7 +2030,7 @@ begin
     if (lAttempt >= CRetryAttempts) or (not IsThrottleError(lError)) then
       raise Exception.CreateFmt('yt-dlp listing failed for %s (exit %d): %s', [aListUrl, lExitCode, Trim(lError)]);
 
-    lDelayMs := CThrottleCooldownMs * lAttempt;
+    lDelayMs := GetThrottleRetryDelayMs(lAttempt);
     Sleep(lDelayMs);
   end;
 
@@ -1853,19 +2146,6 @@ begin
       lStdErr.Free;
     end;
 
-    lFiles := TDirectory.GetFiles(lTempDir, '*.srt');
-    if Length(lFiles) = 0 then
-      raise EFileNotFoundException.Create('yt-dlp did not produce an SRT subtitle file. The requested language might not be available or may have a different code.');
-    if Length(lFiles) > 1 then
-      raise Exception.Create('yt-dlp produced multiple SRT files, which is unexpected.');
-
-    lSrtFile := lFiles[0];
-    try
-      lSrtContent := TFile.ReadAllText(lSrtFile, TEncoding.UTF8);
-    Except
-      lSrtContent := TFile.ReadAllText(lSrtFile, TEncoding.default); // retry with non utf8 system encoding
-    end;
-
     lMetaFiles := TDirectory.GetFiles(lTempDir, '*.info.json');
     if Length(lMetaFiles) > 0 then
     begin
@@ -1875,6 +2155,26 @@ begin
         lMetaContent := TFile.ReadAllText(lMetaFiles[0], TEncoding.default);
       end;
       Result.Meta := TTranscriptMetadata.FromJson(lMetaContent);
+    end;
+    if Result.Meta.VideoId = '' then
+      Result.Meta.VideoId := ExtractVideoIdFromUrl(aUrl);
+    if Result.Meta.Url = '' then
+      Result.Meta.Url := NormalizeVideoUrl(aUrl);
+
+    lFiles := TDirectory.GetFiles(lTempDir, '*.srt');
+    if Length(lFiles) = 0 then
+      raise EMissingTranscriptError.Create(
+        'yt-dlp did not produce an SRT subtitle file. The requested language might not be available or may have a different code.',
+        Result.Meta
+      );
+    if Length(lFiles) > 1 then
+      raise Exception.Create('yt-dlp produced multiple SRT files, which is unexpected.');
+
+    lSrtFile := lFiles[0];
+    try
+      lSrtContent := TFile.ReadAllText(lSrtFile, TEncoding.UTF8);
+    Except
+      lSrtContent := TFile.ReadAllText(lSrtFile, TEncoding.default); // retry with non utf8 system encoding
     end;
 
     Result.Transcript := ParseSrtContent(lSrtContent);
