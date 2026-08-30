@@ -43,7 +43,7 @@ meta=true
 output_dir=output\
 prefix_separator= - 
 cookies_file=
-cookies_from_browser=firefox
+cookies_from_browser=
 # cookies_from_browser=firefox:default-release
 # cookies_from_browser=chrome:Profile 1
 

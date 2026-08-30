@@ -45,6 +45,8 @@ type
     IncludeLive: Boolean;
     CookiesFile: String;
     CookiesFromBrowser: String;
+    CookiesFileExplicit: Boolean;
+    CookiesFromBrowserExplicit: Boolean;
     DelayJitterMs: Integer;
     RetryUnavailable: Boolean;
   end;
@@ -415,7 +417,10 @@ begin
     lLines.Add('output_dir=output\');
     lLines.Add('prefix_separator= - ');
     lLines.Add('cookies_file=');
-    lLines.Add('cookies_from_browser=firefox');
+    lLines.Add('cookies_from_browser=');
+    lLines.Add('; cookies_from_browser=firefox');
+    lLines.Add('; cookies_from_browser=firefox:default-release');
+    lLines.Add('; cookies_from_browser=chrome:Profile 1');
     lLines.Add('');
     lLines.Add('[meta]');
     lLines.Add('url=true');
@@ -498,7 +503,7 @@ begin
 
     aConfig.PrefixSeparator := lIni.ReadString(CDefaultSection, CDefaultPrefixSeparatorKey, ' - ');
     aConfig.CookiesFile := Trim(lIni.ReadString(CDefaultSection, CDefaultCookiesFileKey, ''));
-    aConfig.CookiesFromBrowser := Trim(lIni.ReadString(CDefaultSection, CDefaultCookiesFromBrowserKey, 'firefox'));
+    aConfig.CookiesFromBrowser := Trim(lIni.ReadString(CDefaultSection, CDefaultCookiesFromBrowserKey, ''));
     LoadMetaOptions(lIni, aConfig.MetaOptions);
   finally
     lIni.Free;
@@ -819,6 +824,13 @@ begin
 
   if Trim(aConfig.CookiesFromBrowser) <> '' then
     Result := Result + Format(' --cookies-from-browser "%s"', [Trim(aConfig.CookiesFromBrowser)]);
+end;
+
+function ShouldRetryWithoutDefaultAuth(const aConfig: TCommandLineConfig): Boolean;
+begin
+  Result := ((Trim(aConfig.CookiesFile) <> '') or (Trim(aConfig.CookiesFromBrowser) <> '')) and
+    (not aConfig.CookiesFileExplicit) and
+    (not aConfig.CookiesFromBrowserExplicit);
 end;
 
 function IsMissingSubtitleError(const aMessage: string): Boolean;
@@ -1225,7 +1237,21 @@ begin
 
   lYtDlpExtraArgs := BuildYtDlpAuthArguments(aConfig);
   gc(lSetupService, TTranscriptService.Create);
-  lSeedMeta := lSetupService.FetchMetadata(aConfig.URL, lYtDlpExtraArgs);
+  try
+    lSeedMeta := lSetupService.FetchMetadata(aConfig.URL, lYtDlpExtraArgs);
+  except
+    on Exception do
+    begin
+      if ShouldRetryWithoutDefaultAuth(aConfig) and (Trim(lYtDlpExtraArgs) <> '') then
+      begin
+        WriteLn('Warning: default cookie auth failed; retrying without cookies.');
+        lYtDlpExtraArgs := '';
+        lSeedMeta := lSetupService.FetchMetadata(aConfig.URL, lYtDlpExtraArgs);
+      end
+      else
+        raise;
+    end;
+  end;
   lVideoUrls := BuildChannelVideoQueue(lSetupService, lSeedMeta, aConfig, lYtDlpExtraArgs);
   if Length(lVideoUrls) = 0 then
     raise Exception.Create('Channel mode could not find any videos to process.');
@@ -1617,7 +1643,14 @@ begin
     begin
       if E is EMissingTranscriptError then
         aMeta := EMissingTranscriptError(E).Metadata;
-      raise;
+      if ShouldRetryWithoutDefaultAuth(aConfig) and (Trim(lYtDlpExtraArgs) <> '') then
+      begin
+        WriteLn('Warning: default cookie auth failed; retrying without cookies.');
+        lYtDlpExtraArgs := '';
+        lTranscript := lService.FetchTranscript(aConfig.URL, aConfig.Language, lYtDlpExtraArgs);
+      end
+      else
+        raise;
     end;
   end;
   lOutputText := lTranscript.Transcript;
@@ -2133,6 +2166,8 @@ begin
     raise EArgumentException.Create(
       'Use only one settings default: either [default].cookies_file or [default].cookies_from_browser.'
     );
+  Result.CookiesFileExplicit := lCookiesFileProvided;
+  Result.CookiesFromBrowserExplicit := lCookiesBrowserProvided;
   if Result.ChannelMode then
     Result.IncludeMeta := True;
 end;
