@@ -69,6 +69,8 @@ type
     function Entries: TArray<TDownloadEntry>;
     function IsEligible(const aEntry: TDownloadEntry): Boolean;
     function ThrottleCooldownRemainingMs(const aNowUtc: TDateTime): Int64;
+    function SavedThrottleLevel: Integer;
+    function SavedThrottleSuccessCount: Integer;
     procedure RemoveStandaloneVideo(const aGroupIndex, aVideoIndex: Integer);
     procedure RemoveStandaloneVideoByUrl(const aGroupIndex: Integer;
       const aUrl: string);
@@ -115,14 +117,16 @@ const
      'include_live', 'overwrite_existing', 'metadata', 'keywords', 'notes',
      'state');
   CEntrySequences: array[0..1] of string = ('channels', 'videos');
-  CStateFields: array[0..24] of string =
+  CStateFields: array[0..29] of string =
     ('status', 'last_attempt_utc', 'attempt_count', 'video_id',
      'video_published_at', 'error_kind', 'error', 'last_success_utc',
      'channel_id', 'downloaded', 'skipped', 'unavailable',
      'unavailable_cached', 'failed', 'deferred', 'last_run_started_utc',
      'last_checkpoint_utc', 'last_run_completed_utc', 'processed',
       'eligibility_skipped', 'overwritten', 'total', 'message', 'url',
-      'throttle_retry_after_utc');
+      'throttle_retry_after_utc', 'throttle_level',
+      'throttle_success_count', 'deferred_queue_entries',
+      'deferred_channel_videos', 'channel_slices');
 
 function DownloadModeToString(const aMode: TDownloadMode): string;
 begin
@@ -411,10 +415,10 @@ begin
     lDefaults := lValue.AsMapping;
     ValidateFields(lDefaults, 'defaults', CDefaultFields);
     MappingInt(lDefaults, 'jobs', 1, 1);
-    MappingInt(lDefaults, 'request_interval_ms', 3000, 0);
-    MappingInt(lDefaults, 'delay_jitter_ms', 1200, 0);
-    MappingInt(lDefaults, 'sleep_requests_seconds', 1, 0);
-    MappingInt(lDefaults, 'sleep_subtitles_seconds', 3, 0);
+    MappingInt(lDefaults, 'request_interval_ms', 10000, 0);
+    MappingInt(lDefaults, 'delay_jitter_ms', 10000, 0);
+    MappingInt(lDefaults, 'sleep_requests_seconds', 3, 0);
+    MappingInt(lDefaults, 'sleep_subtitles_seconds', 5, 0);
     MappingInt(lDefaults, 'socket_timeout_seconds', 60, 0);
     if lDefaults.ContainsKey('cookies') and lDefaults.ContainsKey('cookies_from_browser') and
        (Trim(lDefaults.S['cookies']) <> '') and (Trim(lDefaults.S['cookies_from_browser']) <> '') then
@@ -438,10 +442,10 @@ begin
       lPath := Format('groups[%d]', [I]);
       ValidateFields(lGroup, lPath, CGroupFields);
       MappingInt(lGroup, 'jobs', 1, 1);
-      MappingInt(lGroup, 'request_interval_ms', 3000, 0);
-      MappingInt(lGroup, 'delay_jitter_ms', 1200, 0);
-      MappingInt(lGroup, 'sleep_requests_seconds', 1, 0);
-      MappingInt(lGroup, 'sleep_subtitles_seconds', 3, 0);
+      MappingInt(lGroup, 'request_interval_ms', 10000, 0);
+      MappingInt(lGroup, 'delay_jitter_ms', 10000, 0);
+      MappingInt(lGroup, 'sleep_requests_seconds', 3, 0);
+      MappingInt(lGroup, 'sleep_subtitles_seconds', 5, 0);
       MappingInt(lGroup, 'socket_timeout_seconds', 60, 0);
       for lKey in CEntrySequences do
         if lGroup.TryGetValue(lKey, lValue) then
@@ -462,10 +466,10 @@ begin
             if Trim(MappingString(lEntry, 'url', '')) = '' then
               raise EDownloadFileError.CreateFmt('%s.%s[%d].url is required', [lPath, lKey, J]);
             MappingInt(lEntry, 'jobs', 1, 1);
-            MappingInt(lEntry, 'request_interval_ms', 3000, 0);
-            MappingInt(lEntry, 'delay_jitter_ms', 1200, 0);
-            MappingInt(lEntry, 'sleep_requests_seconds', 1, 0);
-            MappingInt(lEntry, 'sleep_subtitles_seconds', 3, 0);
+            MappingInt(lEntry, 'request_interval_ms', 10000, 0);
+            MappingInt(lEntry, 'delay_jitter_ms', 10000, 0);
+            MappingInt(lEntry, 'sleep_requests_seconds', 3, 0);
+            MappingInt(lEntry, 'sleep_subtitles_seconds', 5, 0);
             MappingInt(lEntry, 'socket_timeout_seconds', 60, 0);
             if MappingBool(lGroup, 'enabled', True) and MappingBool(lEntry, 'enabled', True) then
             begin
@@ -529,10 +533,10 @@ begin
   lBase.Language := 'en';
   lBase.OutputDir := 'output';
   lBase.Jobs := 1;
-  lBase.RequestIntervalMs := 3000;
-  lBase.DelayJitterMs := 1200;
-  lBase.SleepRequestsSeconds := 1;
-  lBase.SleepSubtitlesSeconds := 3;
+  lBase.RequestIntervalMs := 10000;
+  lBase.DelayJitterMs := 10000;
+  lBase.SleepRequestsSeconds := 3;
+  lBase.SleepSubtitlesSeconds := 5;
   lBase.SocketTimeoutSeconds := 60;
   lBase.Metadata := True;
   if FRoot.ContainsKey('defaults') then
@@ -611,7 +615,9 @@ begin
     dmFailed:
       Result := lFailed;
     dmThrottled:
-      Result := SameText(aEntry.StateStatus, 'throttled');
+      Result := SameText(aEntry.StateStatus, 'throttled') or
+        (SameText(aEntry.StateStatus, 'running') and
+         (SavedThrottleLevel > 0));
     dmAll:
       Result := True;
   else
@@ -637,6 +643,21 @@ begin
   if lRetryAtUtc <= aNowUtc then
     Exit;
   Result := MilliSecondsBetween(lRetryAtUtc, aNowUtc);
+end;
+
+function TDownloadFile.SavedThrottleLevel: Integer;
+begin
+  Result := 0;
+  if FRoot.ContainsKey('state') then
+    Result := MappingInt(FRoot['state'].AsMapping, 'throttle_level', 0, 0);
+end;
+
+function TDownloadFile.SavedThrottleSuccessCount: Integer;
+begin
+  Result := 0;
+  if FRoot.ContainsKey('state') then
+    Result := MappingInt(FRoot['state'].AsMapping,
+      'throttle_success_count', 0, 0);
 end;
 
 procedure TDownloadFile.SetMode(const aValue: TDownloadMode);

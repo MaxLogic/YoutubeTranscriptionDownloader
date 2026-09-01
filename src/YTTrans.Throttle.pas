@@ -3,7 +3,8 @@ unit YTTrans.Throttle;
 interface
 
 uses
-  System.SyncObjs;
+  System.SyncObjs,
+  System.SysUtils;
 
 type
   TThrottleController = class
@@ -11,45 +12,59 @@ type
     FLock: TCriticalSection;
     FCooldownUntil: UInt64;
     FNextRequestAt: UInt64;
-    FConsecutiveThrottles: Integer;
+    FThrottleLevel: Integer;
+    FSuccessfulVideosSinceThrottle: Integer;
     FEffectiveWorkers: Integer;
-    FMinRequestIntervalMs: Cardinal;
-    FTerminal: Boolean;
-    function DelayForAttempt(const aAttempt: Integer): Cardinal;
+    FRequestIntervalMs: Cardinal;
+    FRequestJitterMs: Cardinal;
+    function DelayForLevel(const aLevel: Integer): Cardinal;
+    function RandomRequestDelayMs: Cardinal;
   public
     constructor Create(const aConfiguredWorkers: Integer;
-      const aMinRequestIntervalMs: Cardinal = 3000);
+      const aRequestIntervalMs: Cardinal = 10000;
+      const aRequestJitterMs: Cardinal = 10000);
     destructor Destroy; override;
     procedure BeforeRequest;
     procedure ReportResult(const aExitCode: Integer; const aOutput: string);
-    procedure SetMinRequestInterval(const aValueMs: Cardinal);
+    procedure ReportVideoSuccess;
+    procedure RestoreState(const aThrottleLevel,
+      aSuccessfulVideosSinceThrottle: Integer;
+      const aCooldownRemainingMs: Cardinal);
+    procedure SetRequestInterval(const aValueMs, aJitterMs: Cardinal);
     function CooldownRemainingMs: Cardinal;
-    function ThrottleAttempt: Integer;
+    function RequestWaitRemainingMs: Cardinal;
+    function ThrottleLevel: Integer;
+    function EffectiveSleepSeconds(const aBaseSeconds: Integer): Integer;
+    function SuccessfulVideosSinceThrottle: Integer;
     function EffectiveWorkers: Integer;
-    function IsTerminal: Boolean;
+    function IsParked: Boolean;
     class function IsThrottleMessage(const aMessage: string): Boolean; static;
   end;
 
 implementation
 
 uses
-  System.SysUtils,
   System.StrUtils,
   System.Classes;
 
 const
-  CThrottleDelays: array[1..2] of Cardinal = (120000, 600000);
-  CTerminalThrottleAttempt = 3;
+  CThrottleDelayMinutes: array[1..8] of Cardinal =
+    (2, 5, 10, 15, 30, 45, 60, 90);
+  CTerminalThrottleLevel = 9;
+  CThrottleJitterPercent = 10;
+  CSuccessfulVideosPerRecoveryLevel = 5;
 
 constructor TThrottleController.Create(const aConfiguredWorkers: Integer;
-  const aMinRequestIntervalMs: Cardinal);
+  const aRequestIntervalMs, aRequestJitterMs: Cardinal);
 begin
   inherited Create;
   FLock := TCriticalSection.Create;
   FEffectiveWorkers := aConfiguredWorkers;
   if FEffectiveWorkers < 1 then
     FEffectiveWorkers := 1;
-  FMinRequestIntervalMs := aMinRequestIntervalMs;
+  FRequestIntervalMs := aRequestIntervalMs;
+  FRequestJitterMs := aRequestJitterMs;
+  Randomize;
 end;
 
 destructor TThrottleController.Destroy;
@@ -58,16 +73,33 @@ begin
   inherited;
 end;
 
-function TThrottleController.DelayForAttempt(const aAttempt: Integer): Cardinal;
+function TThrottleController.DelayForLevel(const aLevel: Integer): Cardinal;
 var
-  lIndex: Integer;
+  lBaseDelayMs: Cardinal;
+  lJitterMs: Cardinal;
 begin
-  lIndex := aAttempt;
-  if lIndex < Low(CThrottleDelays) then
-    lIndex := Low(CThrottleDelays)
-  else if lIndex > High(CThrottleDelays) then
-    lIndex := High(CThrottleDelays);
-  Result := CThrottleDelays[lIndex];
+  if (aLevel < Low(CThrottleDelayMinutes)) or
+     (aLevel > High(CThrottleDelayMinutes)) then
+    Exit(0);
+  lBaseDelayMs := CThrottleDelayMinutes[aLevel] * 60 * 1000;
+  lJitterMs := lBaseDelayMs div (100 div CThrottleJitterPercent);
+  Result := lBaseDelayMs - lJitterMs + Cardinal(Random(lJitterMs * 2 + 1));
+end;
+
+function TThrottleController.RandomRequestDelayMs: Cardinal;
+var
+  lDelay: UInt64;
+  lMultiplierPercent: Cardinal;
+begin
+  lDelay := FRequestIntervalMs;
+  if FRequestJitterMs > 0 then
+    Inc(lDelay, Cardinal(Random(FRequestJitterMs + 1)));
+  lMultiplierPercent := 100 + Cardinal(FThrottleLevel * 50);
+  lDelay := (lDelay * lMultiplierPercent) div 100;
+  if lDelay > High(Cardinal) then
+    Result := High(Cardinal)
+  else
+    Result := Cardinal(lDelay);
 end;
 
 class function TThrottleController.IsThrottleMessage(
@@ -87,19 +119,27 @@ end;
 
 procedure TThrottleController.BeforeRequest;
 var
-  lWaitUntil, lNow: UInt64;
+  lWaitUntil, lNow, lDeadline: UInt64;
 begin
   while True do
   begin
     FLock.Enter;
     try
+      lNow := TThread.GetTickCount64;
+      if (FThrottleLevel >= CTerminalThrottleLevel) and
+         (lNow >= FCooldownUntil) then
+      begin
+        FThrottleLevel := High(CThrottleDelayMinutes);
+        FSuccessfulVideosSinceThrottle := 0;
+      end;
       lWaitUntil := FCooldownUntil;
       if FNextRequestAt > lWaitUntil then
         lWaitUntil := FNextRequestAt;
-      lNow := TThread.GetTickCount64;
       if lNow >= lWaitUntil then
       begin
-        FNextRequestAt := lNow + FMinRequestIntervalMs;
+        lDeadline := lNow + RandomRequestDelayMs;
+        if lDeadline > FNextRequestAt then
+          FNextRequestAt := lDeadline;
         Exit;
       end;
     finally
@@ -117,35 +157,88 @@ var
 begin
   FLock.Enter;
   try
-    lDeadline := TThread.GetTickCount64 + FMinRequestIntervalMs;
-    if lDeadline > FNextRequestAt then
-      FNextRequestAt := lDeadline;
     if IsThrottleMessage(aOutput) then
     begin
-      Inc(FConsecutiveThrottles);
+      if FThrottleLevel < CTerminalThrottleLevel then
+        Inc(FThrottleLevel);
+      FSuccessfulVideosSinceThrottle := 0;
       FEffectiveWorkers := 1;
-      FTerminal := FConsecutiveThrottles >= CTerminalThrottleAttempt;
-      lDelay := DelayForAttempt(FConsecutiveThrottles);
+      if FThrottleLevel < CTerminalThrottleLevel then
+        lDelay := DelayForLevel(FThrottleLevel)
+      else
+        lDelay := DelayForLevel(High(CThrottleDelayMinutes));
       lDeadline := TThread.GetTickCount64 + lDelay;
       if lDeadline > FCooldownUntil then
         FCooldownUntil := lDeadline;
+    end;
+    lDeadline := TThread.GetTickCount64 + RandomRequestDelayMs;
+    if lDeadline > FNextRequestAt then
+      FNextRequestAt := lDeadline;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+procedure TThrottleController.ReportVideoSuccess;
+begin
+  FLock.Enter;
+  try
+    if (FThrottleLevel <= 0) or
+       (FThrottleLevel >= CTerminalThrottleLevel) then
+    begin
+      FSuccessfulVideosSinceThrottle := 0;
       Exit;
     end;
-    if aExitCode = 0 then
+    Inc(FSuccessfulVideosSinceThrottle);
+    if FSuccessfulVideosSinceThrottle >= CSuccessfulVideosPerRecoveryLevel then
     begin
-      FConsecutiveThrottles := 0;
-      FTerminal := False;
+      Dec(FThrottleLevel);
+      FSuccessfulVideosSinceThrottle := 0;
     end;
   finally
     FLock.Leave;
   end;
 end;
 
-procedure TThrottleController.SetMinRequestInterval(const aValueMs: Cardinal);
+procedure TThrottleController.RestoreState(const aThrottleLevel,
+  aSuccessfulVideosSinceThrottle: Integer;
+  const aCooldownRemainingMs: Cardinal);
 begin
   FLock.Enter;
   try
-    FMinRequestIntervalMs := aValueMs;
+    FThrottleLevel := aThrottleLevel;
+    if FThrottleLevel < 0 then
+      FThrottleLevel := 0
+    else if FThrottleLevel > CTerminalThrottleLevel then
+      FThrottleLevel := CTerminalThrottleLevel;
+
+    FSuccessfulVideosSinceThrottle := aSuccessfulVideosSinceThrottle;
+    if FSuccessfulVideosSinceThrottle < 0 then
+      FSuccessfulVideosSinceThrottle := 0
+    else if FSuccessfulVideosSinceThrottle >= CSuccessfulVideosPerRecoveryLevel then
+      FSuccessfulVideosSinceThrottle := CSuccessfulVideosPerRecoveryLevel - 1;
+    if FThrottleLevel = 0 then
+      FSuccessfulVideosSinceThrottle := 0
+    else
+      FEffectiveWorkers := 1;
+
+    if aCooldownRemainingMs > 0 then
+      FCooldownUntil := TThread.GetTickCount64 + aCooldownRemainingMs
+    else
+      FCooldownUntil := 0;
+    FNextRequestAt := 0;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+procedure TThrottleController.SetRequestInterval(const aValueMs,
+  aJitterMs: Cardinal);
+begin
+  FLock.Enter;
+  try
+    FRequestIntervalMs := aValueMs;
+    FRequestJitterMs := aJitterMs;
   finally
     FLock.Leave;
   end;
@@ -167,11 +260,58 @@ begin
   end;
 end;
 
-function TThrottleController.ThrottleAttempt: Integer;
+function TThrottleController.RequestWaitRemainingMs: Cardinal;
+var
+  lNow: UInt64;
 begin
   FLock.Enter;
   try
-    Result := FConsecutiveThrottles;
+    lNow := TThread.GetTickCount64;
+    if FNextRequestAt > lNow then
+      Result := Cardinal(FNextRequestAt - lNow)
+    else
+      Result := 0;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TThrottleController.ThrottleLevel: Integer;
+begin
+  FLock.Enter;
+  try
+    Result := FThrottleLevel;
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TThrottleController.EffectiveSleepSeconds(
+  const aBaseSeconds: Integer): Integer;
+var
+  lScaledSeconds: Int64;
+begin
+  if aBaseSeconds <= 0 then
+    Exit(0);
+
+  FLock.Enter;
+  try
+    lScaledSeconds := Int64(aBaseSeconds) * (100 + FThrottleLevel * 50);
+    lScaledSeconds := (lScaledSeconds + 99) div 100;
+    if lScaledSeconds > High(Integer) then
+      Result := High(Integer)
+    else
+      Result := Integer(lScaledSeconds);
+  finally
+    FLock.Leave;
+  end;
+end;
+
+function TThrottleController.SuccessfulVideosSinceThrottle: Integer;
+begin
+  FLock.Enter;
+  try
+    Result := FSuccessfulVideosSinceThrottle;
   finally
     FLock.Leave;
   end;
@@ -187,11 +327,11 @@ begin
   end;
 end;
 
-function TThrottleController.IsTerminal: Boolean;
+function TThrottleController.IsParked: Boolean;
 begin
   FLock.Enter;
   try
-    Result := FTerminal;
+    Result := FThrottleLevel >= CTerminalThrottleLevel;
   finally
     FLock.Leave;
   end;

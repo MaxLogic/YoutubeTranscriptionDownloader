@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom"
+      xmlns:yt="http://www.youtube.com/xml/schemas/2015">
+  <yt:channelId>UC1234567890example</yt:channelId>
+  <entry>
+    <yt:videoId>rssNEW12345</yt:videoId>
+    <title>Rate limit deep dive</title>
+    <published>2030-01-09T12:00:00+00:00</published>
+  </entry>
+  <entry>
+    <yt:videoId>abcDEF12345</yt:videoId>
+    <published>2029-12-31T12:00:00+00:00</published>
+  </entry>
+</feed>

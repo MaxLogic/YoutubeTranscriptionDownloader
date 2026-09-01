@@ -52,6 +52,7 @@
       <MainSource>MainSource</MainSource>
     </DelphiCompile>
     <DCCReference Include="YTTrans.DownloadFile.Tests.pas"/>
+    <DCCReference Include="..\src\YTTrans.ChannelIndex.pas"/>
     <BuildConfiguration Include="Release">
       <Key>Cfg_1</Key>
       <CfgParent>Base</CfgParent>

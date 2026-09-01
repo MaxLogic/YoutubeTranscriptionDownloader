@@ -1,15 +1,18 @@
 # Copy this file to download.yaml, then edit the queue.
 schema: 1
+# fresh uses RSS when a valid channel index is newer than 30 days.
+# failed/throttled reuse that index; all forces complete reconciliation.
 mode: fresh # fresh, failed, throttled, or all
 
 defaults:
   language: en
   output_dir: output
   jobs: 1
-  request_interval_ms: 3000
-  delay_jitter_ms: 2000
-  sleep_requests_seconds: 1
-  sleep_subtitles_seconds: 3
+  request_interval_ms: 10000
+  delay_jitter_ms: 10000
+  # Both command pacing and the yt-dlp sleeps grow with the throttle level.
+  sleep_requests_seconds: 3
+  sleep_subtitles_seconds: 5
   socket_timeout_seconds: 60
 
 groups:
