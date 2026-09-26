@@ -85,6 +85,8 @@ type
     [Test] procedure CooldownBlocksEveryRequestClass;
     [Test] procedure CaptionlessFetchesSkipTheSubtitleGap;
     [Test] procedure SubtitleTrackPrefersOriginalOverTranslatedAuto;
+    [Test] procedure SubtitleTrackRankingFollowsLanguagePriority;
+    [Test] procedure FetchTranscriptPrefersEnglishOverRequestedLanguage;
     [Test] procedure RssRequestsUseExtractionPacing;
     [Test] procedure ExplicitZeroIntervalSkipsBaseGap;
     [Test] procedure SubtitleUrlExpiringBeforeGateIsReextracted;
@@ -2590,6 +2592,88 @@ begin
   Track := SelectSubtitleTrack(LoadFixture('info-manual-subs.json'), ['en']);
   Assert.AreEqual(Ord(stkManual), Ord(Track.Kind));
   Assert.AreEqual('manual', SubtitleTrackKindToString(Track.Kind));
+end;
+
+procedure TDownloadFileTests.SubtitleTrackRankingFollowsLanguagePriority;
+
+  // info.json with the given automatic captions; `+` marks a machine
+  // translation from `src`.
+  function Info(const aTracks: array of string; const aManual: string = '';
+    const aLanguage: string = ''): string;
+  var
+    lTrack, lKey, lTlang, lCaps: string;
+  begin
+    lCaps := '';
+    for lTrack in aTracks do
+    begin
+      lKey := lTrack.Replace('+', '');
+      lTlang := '';
+      if lTrack.EndsWith('+') then
+        lTlang := '&tlang=' + lKey;
+      if lCaps <> '' then
+        lCaps := lCaps + ',';
+      lCaps := lCaps + Format('"%s":[{"ext":"srt","url":"https://www.youtube.com/' +
+        'api/timedtext?v=rankAAAAAAA&kind=asr&lang=src%s&fmt=srt&track=%s"}]',
+        [lKey, lTlang, lKey]);
+    end;
+    Result := '{"id":"rankAAAAAAA","subtitles":{';
+    if aManual <> '' then
+      Result := Result + Format('"%s":[{"ext":"srt","url":"https://www.youtube.com/' +
+        'api/timedtext?v=rankAAAAAAA&lang=%s&fmt=srt&track=manual-%s"}]',
+        [aManual, aManual, aManual]);
+    Result := Result + '},"automatic_captions":{' + lCaps + '}';
+    if aLanguage <> '' then
+      Result := Result + Format(',"language":"%s"', [aLanguage]);
+    Result := Result + '}';
+  end;
+
+  procedure Check(const aInfoJson, aLanguage: string;
+    const aKind: TSubtitleTrackKind; const aStep: string);
+  var
+    lTrack: TSubtitleTrack;
+  begin
+    lTrack := SelectSubtitleTrack(aInfoJson, ['en', 'de']);
+    Assert.IsTrue(lTrack.Found, aStep);
+    Assert.AreEqual(aLanguage, lTrack.Language, aStep);
+    Assert.AreEqual(Ord(aKind), Ord(lTrack.Kind), aStep);
+  end;
+
+begin
+  Check(Info(['de-orig', 'en-orig', 'fr-orig', 'de+', 'en+']), 'en-orig',
+    stkAuto, '1. original English');
+  Check(Info(['fr-orig', 'en+', 'de-orig']), 'de-orig', stkAuto,
+    '2. original German beats an English translation');
+  Check(Info(['fr-orig', 'de+', 'en+']), 'en', stkAutoTranslated,
+    '3. English translation beats a German one and the video language');
+  Check(Info(['fr-orig', 'es+', 'de+']), 'de', stkAutoTranslated,
+    '4. German translation beats the video language');
+  Check(Info(['es+', 'fr-orig']), 'fr-orig', stkAuto,
+    '5. the video''s own language as the last resort');
+  Check(Info(['es+'], 'fr', 'fr'), 'fr', stkManual,
+    '5. info.json language, manual subtitles');
+  Check(Info(['de-orig'], 'de'), 'de', stkManual,
+    'Manual beats automatic captions in the same language');
+  Assert.IsFalse(SelectSubtitleTrack(Info(['es+']), ['en', 'de']).Found,
+    'Only a translation into another language');
+end;
+
+procedure TDownloadFileTests.FetchTranscriptPrefersEnglishOverRequestedLanguage;
+var
+  Fake: TFakeYtDlp;
+  Service: TTranscriptService;
+begin
+  // info-manual-subs.json has manual `en` and `de` subtitles.
+  Fake := TFakeYtDlp.Create(LoadFixture('info-manual-subs.json'));
+  Service := TTranscriptService.Create(trmRetryInline, Fake.Runner());
+  try
+    Service.FetchTranscript('https://www.youtube.com/watch?v=manualAAAAA',
+      'de', '', 'en');
+    Assert.IsTrue(ContainsText(Fake.SubtitleArgs, '--sub-lang "en"'),
+      Fake.SubtitleArgs);
+  finally
+    Service.Free;
+    Fake.Free;
+  end;
 end;
 
 procedure TDownloadFileTests.RssRequestsUseExtractionPacing;

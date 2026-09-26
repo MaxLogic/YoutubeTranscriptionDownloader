@@ -171,8 +171,9 @@ function ReportYtDlpResponse(const aController: TThrottleController;
   const aRequestClass: TThrottleRequestClass; out aDiagnostics: string;
   const aCompletesRequest: Boolean = True): TThrottleResponseKind;
 procedure SortChannelVideosNewestFirst(var aVideos: TArray<TChannelVideo>);
-// Picks the first language with an srt track: manual subtitles before
-// automatic captions. Returns a track with Found = False when none exists.
+// Picks an srt track: original tracks (manual, then untranslated automatic
+// captions) in aLanguages order, then machine translations in the same order,
+// then the video's own language. Returns Found = False when none exists.
 function SelectSubtitleTrack(const aInfoJson: string;
   const aLanguages: array of string): TSubtitleTrack;
 // Reduces info.json to the chosen track and drops webpage_url/original_url,
@@ -271,6 +272,7 @@ resourcestring
     sLineBreak +
     'Options:' + sLineBreak +
     '  -l, --lang <lang_code>  Language code for subtitles (e.g., "en", "pl"). default is "en".' + sLineBreak +
+    '                          An original English track still wins; see readme.' + sLineBreak +
     '  -o, --output <path>     Video mode: output file path/dir. Channel mode: root output directory.' + sLineBreak +
     '  -p, --prefix <text>     Prefix text for auto-generated file names.' + sLineBreak +
     '  -meta, --meta           Prepend YouTube metadata before the transcript output.' + sLineBreak +
@@ -3376,7 +3378,8 @@ begin
   gc(lService, TTranscriptService.Create(
     TThrottleController.RetryModeForFileMode(aConfig.FileMode)));
   try
-    lTranscript := lService.FetchTranscript(aConfig.URL, aConfig.Language, lYtDlpExtraArgs);
+    lTranscript := lService.FetchTranscript(aConfig.URL, aConfig.Language,
+      lYtDlpExtraArgs, CDefaultLanguage);
   except
     on E: Exception do
     begin
@@ -3389,7 +3392,8 @@ begin
       begin
         WriteLn('Warning: default cookie auth failed; retrying without cookies.');
         lYtDlpExtraArgs := BuildYtDlpPacingArguments(aConfig);
-        lTranscript := lService.FetchTranscript(aConfig.URL, aConfig.Language, lYtDlpExtraArgs);
+        lTranscript := lService.FetchTranscript(aConfig.URL, aConfig.Language,
+          lYtDlpExtraArgs, CDefaultLanguage);
       end
       else
         raise;
@@ -5088,28 +5092,55 @@ var
     lTrack.ExpiresUtc := SubtitleUrlExpiresUtc(aUrl);
   end;
 
+  // Manual subtitles, then automatic captions that are not translations.
+  function PickOriginal(const aLanguage: string): Boolean;
+  var
+    lKey: string;
+  begin
+    Result := Pick(FindSrt('subtitles', aLanguage, lKey), lKey, stkManual) or
+      Pick(FindAuto(aLanguage, False, lKey), lKey, stkAuto);
+  end;
+
+  // The video's own language: info.json `language`, else the ASR source
+  // that YouTube marks as `<lang>-orig`.
+  function PickVideoLanguage: Boolean;
+  var
+    lSection: TJSONValue;
+    lPair: TJSONPair;
+    lName: string;
+  begin
+    lName := Trim(JsonText(lRoot, 'language'));
+    if (lName <> '') and PickOriginal(lName) then
+      Exit(True);
+    lSection := lRoot.Values['automatic_captions'];
+    if lSection is TJSONObject then
+      for lPair in TJSONObject(lSection) do
+      begin
+        lName := lPair.JsonString.Value;
+        if EndsText('-orig', lName) and
+           PickOriginal(Copy(lName, 1, Length(lName) - Length('-orig'))) then
+          Exit(True);
+      end;
+    Result := False;
+  end;
+
 var
-  lLanguage, lKey, lUrl: string;
+  lLanguage, lKey: string;
 begin
-  // Per language: manual subtitles, then original automatic captions, then
-  // machine-translated automatic captions (the most 429-prone guess).
+  // Original tracks in every preferred language first, then machine
+  // translations (the most 429-prone guess) in the same order, then the
+  // video's own language.
   lTrack := Default(TSubtitleTrack);
   lRoot := ParseInfoJsonObject(aInfoJson);
   try
     for lLanguage in aLanguages do
-    begin
-      if Trim(lLanguage) = '' then
-        Continue;
-      lUrl := FindSrt('subtitles', Trim(lLanguage), lKey);
-      if Pick(lUrl, lKey, stkManual) then
-        Break;
-      lUrl := FindAuto(Trim(lLanguage), False, lKey);
-      if Pick(lUrl, lKey, stkAuto) then
-        Break;
-      lUrl := FindAuto(Trim(lLanguage), True, lKey);
-      if Pick(lUrl, lKey, stkAutoTranslated) then
-        Break;
-    end;
+      if (Trim(lLanguage) <> '') and PickOriginal(Trim(lLanguage)) then
+        Exit(lTrack);
+    for lLanguage in aLanguages do
+      if (Trim(lLanguage) <> '') and
+         Pick(FindAuto(Trim(lLanguage), True, lKey), lKey, stkAutoTranslated) then
+        Exit(lTrack);
+    PickVideoLanguage;
   finally
     lRoot.Free;
   end;
@@ -5366,10 +5397,12 @@ begin
     raise EFileNotFoundException.CreateFmt('Required executable not found: %s',
       [GetYtDlpPath]);
 
+  // The fallback (English) is preferred over the requested language: an
+  // original English track beats an original track in the requested one.
   lLanguages := [Trim(aLanguage)];
   if (Trim(aFallbackLanguage) <> '') and
      not SameText(Trim(aFallbackLanguage), Trim(aLanguage)) then
-    lLanguages := lLanguages + [Trim(aFallbackLanguage)];
+    lLanguages := [Trim(aFallbackLanguage)] + lLanguages;
   // yttrans paces subtitle requests itself; yt-dlp's subtitle sleep would
   // stack another delay on top.
   lExtraArgs := WithoutYtDlpOption(aYtDlpExtraArgs, '--sleep-subtitles');
