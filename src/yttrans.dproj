@@ -33,6 +33,8 @@
         <Base_Win32>true</Base_Win32>
         <CfgParent>Base</CfgParent>
         <Base>true</Base>
+        <DCC_Define>madExcept;$(DCC_Define)</DCC_Define>
+        <DCC_MapFile>3</DCC_MapFile>
     </PropertyGroup>
     <PropertyGroup Condition="'$(Config)'=='Release' or '$(Cfg_1)'!=''">
         <Cfg_1>true</Cfg_1>
@@ -176,7 +178,11 @@
         <DCCReference Include="YTTransApp.pas"/>
         <DCCReference Include="YTTrans.ChannelIndex.pas"/>
         <DCCReference Include="YTTrans.DownloadFile.pas"/>
+        <DCCReference Include="YTTrans.MadExcept.pas"/>
+        <DCCReference Include="YTTrans.ProcessRunner.pas"/>
         <DCCReference Include="YTTrans.Throttle.pas"/>
+        <DCCReference Include="..\..\MaxLogicFoundation\MaxLogic.MadExcept.AiRunner.pas"/>
+        <DCCReference Include="..\..\MaxLogicFoundation\maxLogic.MadExcept.pas"/>
         <BuildConfiguration Include="Base">
             <Key>Base</Key>
             <DependentOn>..\..\MaxLogicFoundation\MaxLogicDefault.optset</DependentOn>

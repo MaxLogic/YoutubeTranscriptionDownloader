@@ -86,6 +86,7 @@ modules/
 /output
 /run.bat
 /run.log
+/yttrans.run.jsonl
 /settings.ini
 /download.yaml
 /download.yaml.bak
@@ -95,6 +96,10 @@ modules/
 /tests/.dak/
 /tests/msbuild.log
 /tests/YTTrans.DownloadFile.Tests.res
+/bugreport.txt
+/bugreport.log
+/bugreport-ai-runner-error.txt
+/Log.zip
 .agents/
 .codex/
 .claude/skills/

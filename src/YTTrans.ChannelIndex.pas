@@ -214,13 +214,16 @@ begin
 
   aUpdated := aCurrent;
   aError := '';
-  aThrottleController.BeforeRequest;
+  // RSS is listing work: it takes the short base gap, not a subtitle slot.
+  aThrottleController.BeforeRequest(trcExtraction);
   lStatusCode := 0;
   lBody := '';
   lFetchError := '';
   aFetch('https://www.youtube.com/feeds/videos.xml?channel_id=' +
     aCurrent.ChannelId, lStatusCode, lBody, lFetchError);
-  lCombined := Format('HTTP %d %s', [lStatusCode, lFetchError]);
+  // "HTTP Error 429" is the rate-limit text the throttle classifier expects,
+  // also when the server sends no status text.
+  lCombined := Format('HTTP Error %d: %s', [lStatusCode, lFetchError]);
   if (lStatusCode < 200) or (lStatusCode >= 300) then
     lCombined := lCombined + ' ' + lBody;
   if (lStatusCode >= 200) and (lStatusCode < 300) and
@@ -228,7 +231,7 @@ begin
     lExitCode := 0
   else
     lExitCode := 1;
-  aThrottleController.ReportResult(lExitCode, lCombined);
+  aThrottleController.ReportResult(lExitCode, lCombined, trcExtraction);
   if (lStatusCode = 429) or
      TThrottleController.IsThrottleMessage(lCombined) then
   begin
@@ -236,7 +239,7 @@ begin
       aThrottleCheckpoint;
     aError := Trim(lFetchError);
     if aError = '' then
-      aError := Format('YouTube RSS returned HTTP %d', [lStatusCode]);
+      aError := Format('YouTube RSS returned HTTP Error %d', [lStatusCode]);
     Exit(croThrottled);
   end;
   if lExitCode <> 0 then

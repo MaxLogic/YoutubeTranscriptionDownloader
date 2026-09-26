@@ -7,13 +7,22 @@ mode: fresh # fresh, failed, throttled, or all
 defaults:
   language: en
   output_dir: output
-  jobs: 1
+  # Spacing between subtitle (timedtext) downloads: interval plus random jitter.
   request_interval_ms: 10000
   delay_jitter_ms: 10000
-  # Both command pacing and the yt-dlp sleeps grow with the throttle level.
-  sleep_requests_seconds: 3
-  sleep_subtitles_seconds: 5
+  # Short gap before every request (extraction, metadata, listing, RSS).
+  # Overrides --base-interval-ms (default 3000); 0 disables it. It never
+  # exceeds request_interval_ms. Groups and entries may override it.
+  base_interval_ms: 3000
+  # sleep_subtitles_seconds and jobs are deprecated: accepted, but ignored.
+  # Cooldown levels do not multiply this bounded yt-dlp extraction sleep.
+  sleep_requests_seconds: 1
   socket_timeout_seconds: 60
+  # Logged-out requests are rate-limited per IP. Load cookies from a signed-in
+  # browser (read fresh each run). auto tries firefox, chrome, then edge;
+  # Chrome/Edge usually fail on Windows. Only allowed here in defaults, and
+  # settings.ini [default] cookies_from_browser applies when omitted.
+  # cookies_from_browser: auto
 
 groups:
   # The subfolder applies to every channel and video in this group.

@@ -17,9 +17,9 @@ type
     Language: string;
     OutputDir: string;
     Subfolder: string;
-    Jobs: Integer;
     RequestIntervalMs: Integer;
     DelayJitterMs: Integer;
+    BaseIntervalMs: Integer; // -1 when unset: the CLI --base-interval-ms applies
     SleepRequestsSeconds: Integer;
     SleepSubtitlesSeconds: Integer;
     SocketTimeoutSeconds: Integer;
@@ -67,10 +67,13 @@ type
     class function LoadForTest(const aText, aFileName: string): TDownloadFile;
     destructor Destroy; override;
     function Entries: TArray<TDownloadEntry>;
+    function PrioritizedEntries: TArray<TDownloadEntry>;
     function IsEligible(const aEntry: TDownloadEntry): Boolean;
     function ThrottleCooldownRemainingMs(const aNowUtc: TDateTime): Int64;
+    function ThrottleIdleElapsedMs(const aNowUtc: TDateTime): Int64;
     function SavedThrottleLevel: Integer;
     function SavedThrottleSuccessCount: Integer;
+    function SavedThrottleRecoveryRemaining: Integer;
     procedure RemoveStandaloneVideo(const aGroupIndex, aVideoIndex: Integer);
     procedure RemoveStandaloneVideoByUrl(const aGroupIndex: Integer;
       const aUrl: string);
@@ -98,26 +101,26 @@ uses
 const
   CTopFields: array[0..4] of string =
     ('schema', 'mode', 'defaults', 'groups', 'state');
-  CDefaultFields: array[0..14] of string =
+  CDefaultFields: array[0..15] of string =
     ('language', 'output_dir', 'jobs', 'request_interval_ms', 'delay_jitter_ms',
-     'sleep_requests_seconds', 'sleep_subtitles_seconds',
+     'base_interval_ms', 'sleep_requests_seconds', 'sleep_subtitles_seconds',
      'socket_timeout_seconds', 'include_shorts', 'include_live',
      'overwrite_existing', 'metadata', 'keywords', 'cookies',
      'cookies_from_browser');
-  CGroupFields: array[0..17] of string =
+  CGroupFields: array[0..18] of string =
     ('name', 'enabled', 'subfolder', 'language', 'jobs', 'request_interval_ms',
-     'delay_jitter_ms', 'sleep_requests_seconds', 'sleep_subtitles_seconds',
-     'socket_timeout_seconds', 'include_shorts', 'include_live',
-     'overwrite_existing', 'metadata', 'keywords', 'channels', 'videos',
-     'notes');
-  CEntryFields: array[0..17] of string =
-    ('url', 'name', 'enabled', 'subfolder', 'language', 'jobs',
-     'request_interval_ms', 'delay_jitter_ms', 'sleep_requests_seconds',
+     'delay_jitter_ms', 'base_interval_ms', 'sleep_requests_seconds',
      'sleep_subtitles_seconds', 'socket_timeout_seconds', 'include_shorts',
-     'include_live', 'overwrite_existing', 'metadata', 'keywords', 'notes',
-     'state');
+     'include_live', 'overwrite_existing', 'metadata', 'keywords', 'channels',
+     'videos', 'notes');
+  CEntryFields: array[0..18] of string =
+    ('url', 'name', 'enabled', 'subfolder', 'language', 'jobs',
+     'request_interval_ms', 'delay_jitter_ms', 'base_interval_ms',
+     'sleep_requests_seconds', 'sleep_subtitles_seconds',
+     'socket_timeout_seconds', 'include_shorts', 'include_live',
+     'overwrite_existing', 'metadata', 'keywords', 'notes', 'state');
   CEntrySequences: array[0..1] of string = ('channels', 'videos');
-  CStateFields: array[0..29] of string =
+  CStateFields: array[0..39] of string =
     ('status', 'last_attempt_utc', 'attempt_count', 'video_id',
      'video_published_at', 'error_kind', 'error', 'last_success_utc',
      'channel_id', 'downloaded', 'skipped', 'unavailable',
@@ -125,8 +128,11 @@ const
      'last_checkpoint_utc', 'last_run_completed_utc', 'processed',
       'eligibility_skipped', 'overwritten', 'total', 'message', 'url',
       'throttle_retry_after_utc', 'throttle_level',
-      'throttle_success_count', 'deferred_queue_entries',
-      'deferred_channel_videos', 'channel_slices');
+       'throttle_success_count', 'throttle_recovery_remaining',
+       'throttle_kind', 'throttle_message', 'throttle_operation',
+       'throttle_target', 'throttle_last_response_utc', 'throttle_exit_code',
+       'deferred_queue_entries', 'deferred_channel_videos', 'channel_slices',
+       'source_pause_until_utc', 'source_retry_exhausted', 'source_pause_active');
 
 function DownloadModeToString(const aMode: TDownloadMode): string;
 begin
@@ -414,9 +420,11 @@ begin
     RequireMapping(lValue, 'defaults');
     lDefaults := lValue.AsMapping;
     ValidateFields(lDefaults, 'defaults', CDefaultFields);
+    // Deprecated `jobs` is validated for old files and otherwise ignored.
     MappingInt(lDefaults, 'jobs', 1, 1);
     MappingInt(lDefaults, 'request_interval_ms', 10000, 0);
     MappingInt(lDefaults, 'delay_jitter_ms', 10000, 0);
+    MappingInt(lDefaults, 'base_interval_ms', 0, 0);
     MappingInt(lDefaults, 'sleep_requests_seconds', 3, 0);
     MappingInt(lDefaults, 'sleep_subtitles_seconds', 5, 0);
     MappingInt(lDefaults, 'socket_timeout_seconds', 60, 0);
@@ -444,6 +452,7 @@ begin
       MappingInt(lGroup, 'jobs', 1, 1);
       MappingInt(lGroup, 'request_interval_ms', 10000, 0);
       MappingInt(lGroup, 'delay_jitter_ms', 10000, 0);
+      MappingInt(lGroup, 'base_interval_ms', 0, 0);
       MappingInt(lGroup, 'sleep_requests_seconds', 3, 0);
       MappingInt(lGroup, 'sleep_subtitles_seconds', 5, 0);
       MappingInt(lGroup, 'socket_timeout_seconds', 60, 0);
@@ -468,6 +477,7 @@ begin
             MappingInt(lEntry, 'jobs', 1, 1);
             MappingInt(lEntry, 'request_interval_ms', 10000, 0);
             MappingInt(lEntry, 'delay_jitter_ms', 10000, 0);
+            MappingInt(lEntry, 'base_interval_ms', 0, 0);
             MappingInt(lEntry, 'sleep_requests_seconds', 3, 0);
             MappingInt(lEntry, 'sleep_subtitles_seconds', 5, 0);
             MappingInt(lEntry, 'socket_timeout_seconds', 60, 0);
@@ -499,9 +509,9 @@ var
 begin
   Result := aBase;
   Result.Language := MappingString(aMapping, 'language', Result.Language);
-  Result.Jobs := MappingInt(aMapping, 'jobs', Result.Jobs, 1);
   Result.RequestIntervalMs := MappingInt(aMapping, 'request_interval_ms', Result.RequestIntervalMs, 0);
   Result.DelayJitterMs := MappingInt(aMapping, 'delay_jitter_ms', Result.DelayJitterMs, 0);
+  Result.BaseIntervalMs := MappingInt(aMapping, 'base_interval_ms', Result.BaseIntervalMs, 0);
   Result.SleepRequestsSeconds := MappingInt(aMapping, 'sleep_requests_seconds', Result.SleepRequestsSeconds, 0);
   Result.SleepSubtitlesSeconds := MappingInt(aMapping, 'sleep_subtitles_seconds', Result.SleepSubtitlesSeconds, 0);
   Result.SocketTimeoutSeconds := MappingInt(aMapping, 'socket_timeout_seconds', Result.SocketTimeoutSeconds, 0);
@@ -532,10 +542,10 @@ begin
   lBase := Default(TDownloadOptions);
   lBase.Language := 'en';
   lBase.OutputDir := 'output';
-  lBase.Jobs := 1;
   lBase.RequestIntervalMs := 10000;
   lBase.DelayJitterMs := 10000;
-  lBase.SleepRequestsSeconds := 3;
+  lBase.BaseIntervalMs := -1;
+  lBase.SleepRequestsSeconds := 1;
   lBase.SleepSubtitlesSeconds := 5;
   lBase.SocketTimeoutSeconds := 60;
   lBase.Metadata := True;
@@ -583,6 +593,29 @@ begin
         end;
       end;
   end;
+end;
+
+function TDownloadFile.PrioritizedEntries: TArray<TDownloadEntry>;
+var
+  lEntries: TArray<TDownloadEntry>;
+  lEntry: TDownloadEntry;
+  lIndex: Integer;
+begin
+  lEntries := Entries;
+  SetLength(Result, Length(lEntries));
+  lIndex := 0;
+  for lEntry in lEntries do
+    if lEntry.Kind = dekVideo then
+    begin
+      Result[lIndex] := lEntry;
+      Inc(lIndex);
+    end;
+  for lEntry in lEntries do
+    if lEntry.Kind = dekChannel then
+    begin
+      Result[lIndex] := lEntry;
+      Inc(lIndex);
+    end;
 end;
 
 function TDownloadFile.GetOutputRoot: string;
@@ -645,6 +678,26 @@ begin
   Result := MilliSecondsBetween(lRetryAtUtc, aNowUtc);
 end;
 
+function TDownloadFile.ThrottleIdleElapsedMs(
+  const aNowUtc: TDateTime): Int64;
+var
+  lLastResponseUtc: TDateTime;
+  lState: IYAMLMapping;
+begin
+  Result := 0;
+  if not FRoot.ContainsKey('state') then
+    Exit;
+  lState := FRoot['state'].AsMapping;
+  if not lState.ContainsKey('throttle_last_response_utc') then
+    Exit;
+  if not TryISO8601ToDate(
+    Trim(lState.S['throttle_last_response_utc']), lLastResponseUtc, True) then
+    Exit;
+  if lLastResponseUtc >= aNowUtc then
+    Exit;
+  Result := MilliSecondsBetween(aNowUtc, lLastResponseUtc);
+end;
+
 function TDownloadFile.SavedThrottleLevel: Integer;
 begin
   Result := 0;
@@ -658,6 +711,18 @@ begin
   if FRoot.ContainsKey('state') then
     Result := MappingInt(FRoot['state'].AsMapping,
       'throttle_success_count', 0, 0);
+end;
+
+function TDownloadFile.SavedThrottleRecoveryRemaining: Integer;
+var
+  lState: IYAMLMapping;
+begin
+  Result := -1;
+  if not FRoot.ContainsKey('state') then
+    Exit;
+  lState := FRoot['state'].AsMapping;
+  if lState.ContainsKey('throttle_recovery_remaining') then
+    Result := MappingInt(lState, 'throttle_recovery_remaining', 0, 0);
 end;
 
 procedure TDownloadFile.SetMode(const aValue: TDownloadMode);

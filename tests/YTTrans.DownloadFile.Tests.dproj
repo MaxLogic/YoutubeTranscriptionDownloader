@@ -17,6 +17,8 @@
     <Base_Win32>true</Base_Win32>
     <CfgParent>Base</CfgParent>
     <Base>true</Base>
+    <DCC_Define>madExcept;$(DCC_Define)</DCC_Define>
+    <DCC_MapFile>3</DCC_MapFile>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Config)'=='Release' or '$(Cfg_1)'!=''">
     <Cfg_1>true</Cfg_1>
@@ -52,7 +54,12 @@
       <MainSource>MainSource</MainSource>
     </DelphiCompile>
     <DCCReference Include="YTTrans.DownloadFile.Tests.pas"/>
+    <DCCReference Include="YTTrans.MadExcept.Tests.pas"/>
+    <DCCReference Include="YTTrans.ProcessRunner.Tests.pas"/>
     <DCCReference Include="..\src\YTTrans.ChannelIndex.pas"/>
+    <DCCReference Include="..\src\YTTrans.ProcessRunner.pas"/>
+    <DCCReference Include="..\src\YTTrans.MadExcept.pas"/>
+    <DCCReference Include="..\..\MaxLogicFoundation\MaxLogic.MadExcept.AiRunner.pas"/>
     <BuildConfiguration Include="Release">
       <Key>Cfg_1</Key>
       <CfgParent>Base</CfgParent>
