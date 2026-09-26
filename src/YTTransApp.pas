@@ -2386,7 +2386,7 @@ begin
           AddVideo(lVideo);
       except
         on E: Exception do
-          if IsFatalProcessingException(E) or IsThrottleError(E.Message) then
+          if IsFatalProcessingException(E) or IsThrottleException(E) then
             raise
           else
           begin
@@ -2405,7 +2405,7 @@ begin
           AddVideo(lVideo);
       except
         on E: Exception do
-          if IsFatalProcessingException(E) or IsThrottleError(E.Message) then
+          if IsFatalProcessingException(E) or IsThrottleException(E) then
             raise
           else
           begin
@@ -2423,7 +2423,7 @@ begin
           AddVideo(lVideo);
       except
         on E: Exception do
-          if IsFatalProcessingException(E) or IsThrottleError(E.Message) then
+          if IsFatalProcessingException(E) or IsThrottleException(E) then
             raise
           else
           begin
@@ -2685,7 +2685,7 @@ begin
               raise;
             if ShouldRetryWithoutDefaultAuth(aConfig) and
                (Trim(lYtDlpExtraArgs) <> '') and
-               (not IsThrottleError(E.Message)) then
+               (not IsThrottleException(E)) then
             begin
               WriteLn('Warning: default cookie auth failed; retrying without cookies.');
               lYtDlpExtraArgs := BuildYtDlpPacingArguments(aConfig);
@@ -2702,7 +2702,7 @@ begin
           if IsFatalProcessingException(E) then
             raise;
           if aConfig.FileMode and lHasIndex and
-             (not IsThrottleError(E.Message)) then
+             (not IsThrottleException(E)) then
             lDiscoveryError := 'metadata: ' + E.Message
           else
             raise;
@@ -3114,7 +3114,7 @@ begin
                           lUnavailableMeta := EMissingTranscriptError(E).Metadata;
                         Break;
                       end;
-                      lIsThrottle := IsThrottleError(lFailedMessage);
+                      lIsThrottle := IsThrottleException(E);
                       if lIsThrottle then
                       begin
                         if Assigned(aDiscoveryCache) then
@@ -3385,7 +3385,7 @@ begin
       if E is EMissingTranscriptError then
         aMeta := EMissingTranscriptError(E).Metadata;
       if ShouldRetryWithoutDefaultAuth(aConfig) and
-         (Trim(lYtDlpExtraArgs) <> '') and (not IsThrottleError(E.Message)) then
+         (Trim(lYtDlpExtraArgs) <> '') and (not IsThrottleException(E)) then
       begin
         WriteLn('Warning: default cookie auth failed; retrying without cookies.');
         lYtDlpExtraArgs := BuildYtDlpPacingArguments(aConfig);
@@ -3441,7 +3441,7 @@ begin
           raise;
         if IsMissingSubtitleError(E.Message) or (lAttempt = CRetryAttempts) then
           raise;
-        if IsThrottleError(E.Message) then
+        if IsThrottleException(E) then
           raise;
         lDelayMs := CRetryBaseDelayMs * (1 shl (lAttempt - 1));
         Sleep(lDelayMs);
@@ -4096,7 +4096,7 @@ begin
                 WriteLn('Fatal runtime error; YAML job checkpointed and stopped.');
                 raise;
               end;
-              if IsThrottleError(E.Message) then
+              if IsThrottleException(E) then
               begin
                 if GSourceThrottlePolicy.IsExhausted(lEntry.Url) then
                 begin
