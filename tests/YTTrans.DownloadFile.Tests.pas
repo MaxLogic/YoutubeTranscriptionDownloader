@@ -87,6 +87,8 @@ type
     [Test] procedure SubtitleTrackPrefersOriginalOverTranslatedAuto;
     [Test] procedure SubtitleTrackRankingFollowsLanguagePriority;
     [Test] procedure FetchTranscriptPrefersEnglishOverRequestedLanguage;
+    [Test] procedure FetchTranscriptPrefersPolishOriginalOverTranslation;
+    [Test] procedure FailedTranslationFallsBackToOriginalTrack;
     [Test] procedure RssRequestsUseExtractionPacing;
     [Test] procedure ExplicitZeroIntervalSkipsBaseGap;
     [Test] procedure SubtitleUrlExpiringBeforeGateIsReextracted;
@@ -2101,6 +2103,110 @@ begin
   end;
 end;
 
+// YTD-038: en, de and pl originals beat any machine translation.
+procedure TDownloadFileTests.FetchTranscriptPrefersPolishOriginalOverTranslation;
+const
+  CInfo = '{"id":"polishAAAAA","title":"Polski","subtitles":{},' +
+    '"automatic_captions":{' +
+    '"pl-orig":[{"ext":"srt","url":"https://www.youtube.com/api/timedtext?' +
+    'v=polishAAAAA&kind=asr&lang=pl&fmt=srt&expire=4102444800"}],' +
+    '"en":[{"ext":"srt","url":"https://www.youtube.com/api/timedtext?' +
+    'v=polishAAAAA&kind=asr&lang=pl&tlang=en&fmt=srt&expire=4102444800"}]}}';
+var
+  Fake: TFakeYtDlp;
+  Service: TTranscriptService;
+begin
+  Fake := TFakeYtDlp.Create(CInfo);
+  Service := TTranscriptService.Create(trmReturnToQueue, Fake.Runner());
+  try
+    Service.FetchTranscript('https://www.youtube.com/watch?v=polishAAAAA',
+      'en', '', 'en');
+    Assert.IsTrue(ContainsText(Fake.SubtitleArgs, '--sub-lang "pl-orig"'),
+      Fake.SubtitleArgs);
+    Assert.AreEqual(1, Fake.SubtitleCalls);
+  finally
+    Service.Free;
+    Fake.Free;
+  end;
+end;
+
+// YTD-038: a machine translation that cannot be downloaded gives way to the
+// original track of the same extraction, in both retry modes.
+procedure TDownloadFileTests.FailedTranslationFallsBackToOriginalTrack;
+const
+  CUrl = 'https://www.youtube.com/watch?v=translatedA';
+  CBot = 'ERROR: [youtube] translatedA: Sign in to confirm you''re not a bot.';
+
+  procedure Check(const aMode: TThrottleRetryMode; const aError: string);
+  var
+    lController: TThrottleController;
+    lFake: TFakeYtDlp;
+    lService: TTranscriptService;
+    lTranscript: TTranscriptResult;
+  begin
+    lController := TThrottleController.Create(0, 0, 0);
+    // es-orig plus an English machine translation of it.
+    lFake := TFakeYtDlp.Create(LoadFixture('info-auto-translated.json'));
+    lFake.SubtitleErrors := [aError];
+    lService := TTranscriptService.Create(aMode, lFake.Runner());
+    SetThrottleContext(lController, nil);
+    try
+      lTranscript := lService.FetchTranscript(CUrl, 'en', '', 'en');
+      Assert.AreEqual('Hello world' + sLineBreak + 'Second line' + sLineBreak,
+        lTranscript.Transcript, aError);
+      Assert.AreEqual(1, lFake.ExtractionCalls, 'no re-extraction: ' + aError);
+      Assert.AreEqual(2, lFake.SubtitleCalls, aError);
+      Assert.IsTrue(ContainsText(lFake.SubtitleArgs, '--sub-lang "es-orig"'),
+        lFake.SubtitleArgs);
+      // The absorbed translation 429 must not slow the rest of the run.
+      Assert.AreEqual(0, lController.ThrottleLevel, 'level: ' + aError);
+      Assert.AreEqual(Cardinal(0), lController.CooldownRemainingMs,
+        'cooldown: ' + aError);
+      Assert.AreEqual(0, lController.RateLimitAttemptsForTarget(CUrl),
+        'target budget: ' + aError);
+    finally
+      SetThrottleContext(nil, nil);
+      lService.Free;
+      lFake.Free;
+      lController.Free;
+    end;
+  end;
+
+var
+  Controller: TThrottleController;
+  Fake: TFakeYtDlp;
+  Service: TTranscriptService;
+  Raised: string;
+begin
+  Check(trmReturnToQueue, CSubtitle429);
+  Check(trmRetryInline, CSubtitle429);
+  Check(trmReturnToQueue,
+    'ERROR: Unable to download video subtitles for ''en'': HTTP Error 500: Internal Server Error');
+
+  // A bot challenge is not about the translation: no switch, queue return.
+  Controller := TThrottleController.Create(0, 0, 0);
+  Fake := TFakeYtDlp.Create(LoadFixture('info-auto-translated.json'));
+  Fake.SubtitleErrors := [CBot];
+  Service := TTranscriptService.Create(trmReturnToQueue, Fake.Runner());
+  SetThrottleContext(Controller, nil);
+  try
+    Raised := '';
+    try
+      Service.FetchTranscript(CUrl, 'en', '', 'en');
+    except
+      on E: Exception do
+        Raised := E.ClassName;
+    end;
+    Assert.AreEqual('EThrottleError', Raised);
+    Assert.AreEqual(1, Fake.SubtitleCalls);
+  finally
+    SetThrottleContext(nil, nil);
+    Service.Free;
+    Fake.Free;
+    Controller.Free;
+  end;
+end;
+
 procedure TDownloadFileTests.ThrottledSubtitleRetryReusesSignedUrl;
 const
   CUrl = 'https://www.youtube.com/watch?v=manualAAAAA';
@@ -2150,13 +2256,14 @@ end;
 
 procedure TDownloadFileTests.ExpiredSubtitleUrlTriggersReextraction;
 const
-  CUrl = 'https://www.youtube.com/watch?v=translatedA';
+  CUrl = 'https://www.youtube.com/watch?v=manualAAAAA';
 var
   Fake: TFakeYtDlp;
   Service: TTranscriptService;
 begin
+  // Manual subtitles: a translated track would fall back to its original.
   Fake := TFakeYtDlp.Create(StringReplace(
-    LoadFixture('info-auto-translated.json'), 'expire=4102444800',
+    LoadFixture('info-manual-subs.json'), 'expire=4102444800',
     'expire=1000000000', [rfReplaceAll]));
   Fake.SubtitleErrors := [CSubtitle429];
   Service := TTranscriptService.Create(trmReturnToQueue, Fake.Runner());

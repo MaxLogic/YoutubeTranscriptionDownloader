@@ -91,6 +91,8 @@ type
   end;
 
   EThrottleError = class(Exception);
+  // HTTP 429 on a machine-translated track that has an original to fall back to.
+  ETranslationRateLimited = class(EThrottleError);
 
   // stkAutoTranslated: an automatic caption whose URL has `tlang`, i.e. a
   // machine translation of another language's ASR track.
@@ -124,6 +126,9 @@ type
     // Consulted before an inline throttle retry with the UTC time the retry
     // could start; False aborts with ESubtitleUrlExpired.
     CanRetryAt: TFunc<TDateTime, Boolean>;
+    // On HTTP 429, raise ETranslationRateLimited without throttle escalation,
+    // inline retry or queue return: the caller has another track to try.
+    RaiseOnThrottle: Boolean;
   end;
 
   TTranscriptService = class
@@ -173,13 +178,18 @@ function ReportYtDlpResponse(const aController: TThrottleController;
   const aStdErr, aOperation, aTarget: string;
   const aCountsAsVideoRequest, aBoundedTargetRetries: Boolean;
   const aRequestClass: TThrottleRequestClass; out aDiagnostics: string;
-  const aCompletesRequest: Boolean = True): TThrottleResponseKind;
+  const aCompletesRequest: Boolean = True;
+  const aAbsorbRateLimit: Boolean = False): TThrottleResponseKind;
 procedure SortChannelVideosNewestFirst(var aVideos: TArray<TChannelVideo>);
 // Picks an srt track: original tracks (manual, then untranslated automatic
-// captions) in aLanguages order, then machine translations in the same order,
-// then the video's own language. Returns Found = False when none exists.
+// captions) in aOriginalLanguages order, then machine translations in
+// aTranslationLanguages order, then the video's own language. Both lists
+// empty selects only the video's own language. Found = False when none exists.
 function SelectSubtitleTrack(const aInfoJson: string;
-  const aLanguages: array of string): TSubtitleTrack;
+  const aOriginalLanguages, aTranslationLanguages: array of string): TSubtitleTrack; overload;
+// The same with one list for originals and translations.
+function SelectSubtitleTrack(const aInfoJson: string;
+  const aLanguages: array of string): TSubtitleTrack; overload;
 // Reduces info.json to the chosen track and drops webpage_url/original_url,
 // so `yt-dlp --load-info-json` makes one timedtext request and cannot fall
 // back to a full re-extraction.
@@ -276,7 +286,7 @@ resourcestring
     sLineBreak +
     'Options:' + sLineBreak +
     '  -l, --lang <lang_code>  Language code for subtitles (e.g., "en", "pl"). default is "en".' + sLineBreak +
-    '                          An original English track still wins; see readme.' + sLineBreak +
+    '                          Original en/de/pl tracks beat translations; see readme.' + sLineBreak +
     '  -o, --output <path>     Video mode: output file path/dir. Channel mode: root output directory.' + sLineBreak +
     '  -p, --prefix <text>     Prefix text for auto-generated file names.' + sLineBreak +
     '  -meta, --meta           Prepend YouTube metadata before the transcript output.' + sLineBreak +
@@ -404,6 +414,10 @@ type
     Meta: TTranscriptMetadata;
     Track: TSubtitleTrack;
     InfoJson: string; // reduced by BuildSubtitleInfoJson
+    // For a machine-translated Track: the video's original-language track
+    // and its reduced info.json, saved when the translation cannot be fetched.
+    Fallback: TSubtitleTrack;
+    FallbackInfoJson: string;
   end;
 
 var
@@ -542,13 +556,22 @@ function ReportYtDlpResponse(const aController: TThrottleController;
   const aStdErr, aOperation, aTarget: string;
   const aCountsAsVideoRequest, aBoundedTargetRetries: Boolean;
   const aRequestClass: TThrottleRequestClass; out aDiagnostics: string;
-  const aCompletesRequest: Boolean): TThrottleResponseKind;
+  const aCompletesRequest, aAbsorbRateLimit: Boolean): TThrottleResponseKind;
 var
   lApplyGlobalBackoff: Boolean;
 begin
   aDiagnostics := TThrottleController.YtDlpDiagnostics(aStdErr);
   Result := TThrottleController.ClassifyResponse(aDiagnostics);
   lApplyGlobalBackoff := True;
+  // A 429 the caller absorbs with another track (a machine translation with
+  // an original to fall back to) takes no level, cooldown or target budget.
+  if aAbsorbRateLimit and (Result = trkRateLimit) then
+  begin
+    if Assigned(aController) then
+      aController.ReportResult(aExitCode, aDiagnostics, aRequestClass, False,
+        aOperation, aTarget, False, False, False);
+    Exit;
+  end;
   if Assigned(aPolicy) and aCountsAsVideoRequest then
   begin
     if Result = trkRateLimit then
@@ -4785,7 +4808,7 @@ begin
       GSourceThrottlePolicy, GCurrentSource, GCurrentSourceIsChannel, Result,
       aError, aCall.Operation, aCall.Target, aCall.CountsAsVideoRequest,
       FThrottleRetryMode = trmReturnToQueue, aCall.RequestClass, lDiagnostics,
-      aCall.CompletesRequest);
+      aCall.CompletesRequest, aCall.RaiseOnThrottle);
     if (Result <> 0) or (lResponseKind <> trkNone) then
       lLogMessage := lCombined
     else
@@ -4806,6 +4829,8 @@ begin
     lMessage := NormalizeErrorMessage(lDiagnostics);
     if lMessage = '' then
       lMessage := 'YouTube returned a throttling response.';
+    if aCall.RaiseOnThrottle and (lResponseKind = trkRateLimit) then
+      raise ETranslationRateLimited.Create(lMessage);
     if not Assigned(GThrottleController) then
       raise EThrottleError.Create(lMessage);
     lThrottleLevel := GThrottleController.ThrottleLevel;
@@ -5053,7 +5078,7 @@ begin
 end;
 
 function SelectSubtitleTrack(const aInfoJson: string;
-  const aLanguages: array of string): TSubtitleTrack;
+  const aOriginalLanguages, aTranslationLanguages: array of string): TSubtitleTrack;
 var
   lRoot: TJSONObject;
   lTrack: TSubtitleTrack;
@@ -5159,10 +5184,10 @@ begin
   lTrack := Default(TSubtitleTrack);
   lRoot := ParseInfoJsonObject(aInfoJson);
   try
-    for lLanguage in aLanguages do
+    for lLanguage in aOriginalLanguages do
       if (Trim(lLanguage) <> '') and PickOriginal(Trim(lLanguage)) then
         Exit(lTrack);
-    for lLanguage in aLanguages do
+    for lLanguage in aTranslationLanguages do
       if (Trim(lLanguage) <> '') and
          Pick(FindAuto(Trim(lLanguage), True, lKey), lKey, stkAutoTranslated) then
         Exit(lTrack);
@@ -5171,6 +5196,12 @@ begin
     lRoot.Free;
   end;
   Result := lTrack;
+end;
+
+function SelectSubtitleTrack(const aInfoJson: string;
+  const aLanguages: array of string): TSubtitleTrack;
+begin
+  Result := SelectSubtitleTrack(aInfoJson, aLanguages, aLanguages);
 end;
 
 function BuildSubtitleInfoJson(const aInfoJson: string;
@@ -5349,8 +5380,11 @@ function TTranscriptService.FetchTranscript(const aUrl, aLanguage,
 const
   CMissingSubtitleMessage =
     'yt-dlp did not produce an SRT subtitle file. The requested language might not be available or may have a different code.';
+  // Original tracks in these languages are kept as they are; any other
+  // language is fetched as a machine translation first.
+  CPreferredOriginalLanguages: array[0..1] of string = ('de', 'pl');
 var
-  lLanguages: TArray<string>;
+  lLanguages, lOriginalLanguages: TArray<string>;
   lKey, lExtraArgs: string;
   lSource: TSubtitleSource;
   lReextracted: Boolean;
@@ -5360,6 +5394,7 @@ var
   lFiles: TArray<string>;
   lExitCode: Integer;
   lOutput, lError: string;
+  lPreferOriginal: Boolean; // set once a translation failed in this fetch
 
   function FailureText(const aOutput, aError: string): string;
   begin
@@ -5403,7 +5438,8 @@ var
       if Result.Meta.Url = '' then
         Result.Meta.Url := NormalizeVideoUrl(aUrl);
 
-      Result.Track := SelectSubtitleTrack(lInfoJson, lLanguages);
+      Result.Track := SelectSubtitleTrack(lInfoJson, lOriginalLanguages,
+        lLanguages);
       if not Result.Track.Found then
       begin
         // Captionless: the extraction was the whole video request.
@@ -5412,13 +5448,48 @@ var
           Result.Meta);
       end;
       Result.InfoJson := BuildSubtitleInfoJson(lInfoJson, Result.Track);
+      if Result.Track.Kind = stkAutoTranslated then
+      begin
+        Result.Fallback := SelectSubtitleTrack(lInfoJson, [], []);
+        if Result.Fallback.Found then
+          Result.FallbackInfoJson := BuildSubtitleInfoJson(lInfoJson,
+            Result.Fallback);
+        // A re-extraction after a failed translation keeps the original.
+        if lPreferOriginal and Result.Fallback.Found then
+        begin
+          Result.Track := Result.Fallback;
+          Result.InfoJson := Result.FallbackInfoJson;
+          Result.Fallback := Default(TSubtitleTrack);
+          Result.FallbackInfoJson := '';
+        end;
+      end;
     finally
       TDirectory.Delete(lDir, True);
     end;
   end;
 
+  // A machine translation that cannot be downloaded (HTTP 429 or another
+  // error) gives way to the original track of the same extraction; the
+  // original text can be translated later.
+  function SwitchToOriginal: Boolean;
+  begin
+    Result := (lSource.Track.Kind = stkAutoTranslated) and
+      lSource.Fallback.Found;
+    if not Result then
+      Exit;
+    WriteLn(Format('Notice: the %s translation of %s could not be downloaded; ' +
+      'saving the original %s track instead.',
+      [lSource.Track.Language, aUrl, lSource.Fallback.Language]));
+    lPreferOriginal := True;
+    lSource.Track := lSource.Fallback;
+    lSource.InfoJson := lSource.FallbackInfoJson;
+    lSource.Fallback := Default(TSubtitleTrack);
+    lSource.FallbackInfoJson := '';
+  end;
+
 begin
   Result := Default(TTranscriptResult);
+  lPreferOriginal := False;
   if (not Assigned(FRunner)) and (not TFile.Exists(GetYtDlpPath)) then
     raise EFileNotFoundException.CreateFmt('Required executable not found: %s',
       [GetYtDlpPath]);
@@ -5429,6 +5500,10 @@ begin
   if (Trim(aFallbackLanguage) <> '') and
      not SameText(Trim(aFallbackLanguage), Trim(aLanguage)) then
     lLanguages := [Trim(aFallbackLanguage)] + lLanguages;
+  lOriginalLanguages := Copy(lLanguages);
+  for var lPreferred in CPreferredOriginalLanguages do
+    if IndexText(lPreferred, lOriginalLanguages) < 0 then
+      lOriginalLanguages := lOriginalLanguages + [lPreferred];
   // yttrans paces subtitle requests itself; yt-dlp's subtitle sleep would
   // stack another delay on top.
   lExtraArgs := WithoutYtDlpOption(aYtDlpExtraArgs, '--sleep-subtitles');
@@ -5461,6 +5536,8 @@ begin
         lCall.Arguments := lCall.Arguments +
           Format('-P "%s" -o "%s"', [lTempDir, 'transcript']);
         lCall.TrackKind := SubtitleTrackKindToString(lSource.Track.Kind);
+        lCall.RaiseOnThrottle := (lSource.Track.Kind = stkAutoTranslated) and
+          lSource.Fallback.Found;
         // Bounded, so URLs that never outlive the wait cannot loop forever.
         if lExpiryReextracts < 2 then
           lCall.CanRetryAt :=
@@ -5478,6 +5555,12 @@ begin
             lSource := Extract;
             Continue;
           end;
+          on ETranslationRateLimited do
+          begin
+            if SwitchToOriginal then
+              Continue;
+            raise;
+          end;
         end;
         if lExitCode = 0 then
           Break;
@@ -5489,6 +5572,8 @@ begin
           lSource := Extract;
           Continue;
         end;
+        if SwitchToOriginal then
+          Continue;
         raise Exception.CreateFmt('yt-dlp subtitle download failed (exit %d): %s',
           [lExitCode, FailureText(lOutput, lError)]);
       end;
