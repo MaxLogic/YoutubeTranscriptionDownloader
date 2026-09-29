@@ -108,6 +108,7 @@ type
     [Test] procedure FrontMatterEscapesC1AndNonCharacters;
     [Test] procedure FrontMatterQuotesSexagesimalValues;
     [Test] procedure DeprecatedJobsOptionIsIgnored;
+    [Test] procedure OnlyCookieFailuresRetryWithoutDefaultCookies;
   end;
 
 implementation
@@ -3491,6 +3492,54 @@ begin
   Assert.Contains(Section, sLineBreak + 'duration: "12:34"' + sLineBreak);
   Assert.Contains(Section, sLineBreak + 'uploader: "1:02:03"' + sLineBreak);
   Assert.Contains(Section, sLineBreak + 'channel: Part 1:30' + sLineBreak);
+end;
+
+// T-037: the settings.ini cookie fallback retries without cookies only when
+// the cookies themselves failed, not on content errors reported with cookies.
+procedure TDownloadFileTests.OnlyCookieFailuresRetryWithoutDefaultCookies;
+const
+  CExtracted = 'Extracting cookies from firefox' + sLineBreak +
+    'Extracted 413 cookies from firefox' + sLineBreak;
+
+  function Classify(const aMessage: string): Boolean;
+  var
+    lError: Exception;
+  begin
+    lError := Exception.Create(aMessage);
+    try
+      Result := IsCookieAuthFailure(lError);
+    finally
+      lError.Free;
+    end;
+  end;
+
+var
+  lThrottle: EThrottleError;
+begin
+  Assert.IsTrue(Classify('ERROR: could not find firefox cookies database in ' +
+    'C:\Users\x\AppData\Roaming\Mozilla\Firefox\Profiles'));
+  Assert.IsTrue(Classify('ERROR: Failed to decrypt with DPAPI. See ' +
+    'https://github.com/yt-dlp/yt-dlp/issues/10927 for more info'));
+  Assert.IsTrue(Classify('ERROR: Could not copy Chrome cookie database. See ' +
+    'https://github.com/yt-dlp/yt-dlp/issues/7271 for more info'));
+  Assert.IsTrue(Classify(CExtracted + 'WARNING: [youtube] The provided YouTube ' +
+    'account cookies are no longer valid. They have likely been rotated'));
+  Assert.IsTrue(Classify('sqlite3.OperationalError: database is locked'));
+
+  Assert.IsFalse(Classify(CExtracted + 'yt-dlp did not produce an SRT subtitle ' +
+    'file. The requested language might not be available or may have a ' +
+    'different code.'), 'missing subtitles');
+  Assert.IsFalse(Classify(CExtracted +
+    'ERROR: [youtube] abc: Video unavailable. This video is private'),
+    'unavailable video');
+  Assert.IsFalse(Classify(CExtracted + 'ERROR: Unable to download video ' +
+    'subtitles for ''en'': HTTP Error 429: Too Many Requests'), '429');
+  lThrottle := EThrottleError.Create('could not find firefox cookies database');
+  try
+    Assert.IsFalse(IsCookieAuthFailure(lThrottle), 'throttle exception');
+  finally
+    lThrottle.Free;
+  end;
 end;
 
 procedure TDownloadFileTests.DeprecatedJobsOptionIsIgnored;

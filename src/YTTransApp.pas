@@ -153,6 +153,10 @@ function Run: Integer;
 function IsYouTubeVideoUrl(const aUrl: string): Boolean;
 function IsFatalProcessingException(const aException: Exception): Boolean;
 function IsThrottleException(const aException: Exception): Boolean;
+// True when a failed yt-dlp call made with the settings.ini default cookies
+// failed because of those cookies (unreadable browser store, expired login),
+// so a retry without cookies can help. Content errors are False.
+function IsCookieAuthFailure(const aException: Exception): Boolean;
 function FailureMessage(const aException: Exception): string;
 function DownloadFileExitCode(const aFailedCount: Integer): Integer;
 function ChannelRunHasErrors(const aFailed: Integer;
@@ -1674,6 +1678,28 @@ begin
     IsThrottleError(aException.Message);
 end;
 
+function IsCookieAuthFailure(const aException: Exception): Boolean;
+const
+  // yt-dlp output when the browser store cannot be read or the login expired.
+  // Plain 'cookie' is too broad: successful loads also print
+  // "Extracting cookies from firefox".
+  CPatterns: array[0..6] of string = (
+    'cookies database', 'cookie database', 'failed to decrypt', 'dpapi',
+    'cookies are no longer valid', 'database is locked',
+    'unsupported browser specified for cookies');
+var
+  lPattern: string;
+begin
+  Result := False;
+  if (aException is EMissingTranscriptError) or
+     IsThrottleException(aException) or
+     IsMissingSubtitleError(aException.Message) then
+    Exit;
+  for lPattern in CPatterns do
+    if ContainsText(aException.Message, lPattern) then
+      Exit(True);
+end;
+
 function NormalizeErrorMessage(const aMessage: string): string;
 begin
   Result := StringReplace(Trim(aMessage), #13, ' ', [rfReplaceAll]);
@@ -2687,7 +2713,7 @@ begin
               raise;
             if ShouldRetryWithoutDefaultAuth(aConfig) and
                (Trim(lYtDlpExtraArgs) <> '') and
-               (not IsThrottleException(E)) then
+               IsCookieAuthFailure(E) then
             begin
               WriteLn('Warning: default cookie auth failed; retrying without cookies.');
               lYtDlpExtraArgs := BuildYtDlpPacingArguments(aConfig);
@@ -3388,7 +3414,7 @@ begin
       if E is EMissingTranscriptError then
         aMeta := EMissingTranscriptError(E).Metadata;
       if ShouldRetryWithoutDefaultAuth(aConfig) and
-         (Trim(lYtDlpExtraArgs) <> '') and (not IsThrottleException(E)) then
+         (Trim(lYtDlpExtraArgs) <> '') and IsCookieAuthFailure(E) then
       begin
         WriteLn('Warning: default cookie auth failed; retrying without cookies.');
         lYtDlpExtraArgs := BuildYtDlpPacingArguments(aConfig);

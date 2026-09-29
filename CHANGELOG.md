@@ -45,6 +45,7 @@ All notable changes to this project are documented in this file.
 - `-j/--jobs` and YAML `jobs` are deprecated: still validated so old commands and files work, but ignored. Channel mode uses one worker because the shared gate already spaces subtitle downloads 10 to 20 seconds apart. The worker-limit and effective-worker code is removed, along with the `Workers configured`/`Workers final limit` console lines (T-033).
 
 ### Fixed
+- With a `settings.ini` default cookie source, yttrans retries without cookies only when the cookies themselves failed (unreadable or locked browser store, DPAPI decryption failure, expired login). A video without the requested subtitles or another content error no longer prints "default cookie auth failed" or costs a second, cookieless request (T-037).
 - yt-dlp now starts when yttrans is installed in a folder whose path contains spaces, and a failed start no longer leaks pipe handles (T-028).
 - yt-dlp stdout and stderr are read until the pipes close, so the tail of large output and a final stderr line are no longer lost. yt-dlp gets `NUL` as stdin (T-029).
 - Persistent channel-index stores now retain a function-scoped owner during discovery and reconciliation, preventing a use-after-free access violation.
