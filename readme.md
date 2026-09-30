@@ -56,6 +56,7 @@ channel=true
 created=true
 keywords=true
 video_id=true
+transcript_language=true
 uploader=true
 uploader_id=true
 channel_id=true
@@ -271,6 +272,7 @@ Use `yttrans` for these options. `-meta` is not a `yt-dlp` flag.
 
 *   Default scope is regular uploads/videos only.
 *   `-is` and `-il` expand scope to Shorts and Live tabs.
+*   Front matter records `transcript_language` (`en`, `de`, `pl`, ... without `-orig`): the language of the saved text, which is the original language when no usable translation was available. Files written before this field existed do not have it. Toggle it with `transcript_language` in `[meta]`.
 *   Channel mode always writes metadata front matter and enforces `channel` + `video_id` fields for dedup/overwrite logic.
 *   File naming in channel mode is title-based (`<title>.md`), with conflict probing (`<title> (2).md`, ...) when title collisions refer to different `video_id`s.
 *   Existing file with same `video_id` is skipped by default; use `-ov` to overwrite.

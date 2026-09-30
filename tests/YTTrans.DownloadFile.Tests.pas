@@ -2115,12 +2115,14 @@ const
 var
   Fake: TFakeYtDlp;
   Service: TTranscriptService;
+  Transcript: TTranscriptResult;
 begin
   Fake := TFakeYtDlp.Create(CInfo);
   Service := TTranscriptService.Create(trmReturnToQueue, Fake.Runner());
   try
-    Service.FetchTranscript('https://www.youtube.com/watch?v=polishAAAAA',
-      'en', '', 'en');
+    Transcript := Service.FetchTranscript(
+      'https://www.youtube.com/watch?v=polishAAAAA', 'en', '', 'en');
+    Assert.AreEqual('pl', Transcript.Meta.TranscriptLanguage);
     Assert.IsTrue(ContainsText(Fake.SubtitleArgs, '--sub-lang "pl-orig"'),
       Fake.SubtitleArgs);
     Assert.AreEqual(1, Fake.SubtitleCalls);
@@ -2154,6 +2156,7 @@ const
       lTranscript := lService.FetchTranscript(CUrl, 'en', '', 'en');
       Assert.AreEqual('Hello world' + sLineBreak + 'Second line' + sLineBreak,
         lTranscript.Transcript, aError);
+      Assert.AreEqual('es', lTranscript.Meta.TranscriptLanguage, aError);
       Assert.AreEqual(1, lFake.ExtractionCalls, 'no re-extraction: ' + aError);
       Assert.AreEqual(2, lFake.SubtitleCalls, aError);
       Assert.IsTrue(ContainsText(lFake.SubtitleArgs, '--sub-lang "es-orig"'),
@@ -3359,6 +3362,7 @@ begin
   Result.Created := True;
   Result.Keywords := True;
   Result.VideoId := True;
+  Result.TranscriptLanguage := True;
   Result.Uploader := True;
   Result.UploaderId := True;
   Result.ChannelId := True;
@@ -3400,6 +3404,7 @@ begin
   Meta.Channel := 'Example Story Lab';
   Meta.Created := '2024-03-15';
   Meta.VideoId := 'abcDEF12345';
+  Meta.TranscriptLanguage := 'no';
   Meta.ViewCount := '20035';
   Meta.Tags := 'writing, plot twists';
   Meta.Description := 'Chapters:'#10'00:00 Intro'#10#10'---'#10'video_id: fake';
@@ -3410,6 +3415,8 @@ begin
   Assert.Contains(Text, sLineBreak + 'channel: Example Story Lab' + sLineBreak);
   Assert.Contains(Text, sLineBreak + 'created: 2024-03-15' + sLineBreak);
   Assert.Contains(Text, sLineBreak + 'video_id: abcDEF12345' + sLineBreak);
+  // Norwegian `no` would read as a YAML bool.
+  Assert.Contains(Text, sLineBreak + 'transcript_language: "no"' + sLineBreak);
   Assert.Contains(Text, sLineBreak + 'view_count: 20035' + sLineBreak);
   Assert.Contains(Text, sLineBreak + 'tags: writing, plot twists' + sLineBreak);
   // `: ` and ` #` force double quotes with escaping.

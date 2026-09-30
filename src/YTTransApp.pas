@@ -13,6 +13,7 @@ type
     Created     : Boolean;
     Keywords    : Boolean;
     VideoId     : Boolean;
+    TranscriptLanguage: Boolean;
     Uploader    : Boolean;
     UploaderId  : Boolean;
     ChannelId   : Boolean;
@@ -62,6 +63,8 @@ type
     Channel: String;
     Created: String;
     VideoId: String;
+    // Language of the saved transcript text (track key without `-orig`).
+    TranscriptLanguage: String;
     Uploader: String;
     UploaderId: String;
     ChannelId: String;
@@ -879,6 +882,7 @@ begin
     lLines.Add('created=true');
     lLines.Add('keywords=true');
     lLines.Add('video_id=true');
+    lLines.Add('transcript_language=true');
     lLines.Add('uploader=true');
     lLines.Add('uploader_id=true');
     lLines.Add('channel_id=true');
@@ -907,6 +911,7 @@ begin
   aMetaOptions.Created := ReadMetaOption(aIni, 'created', True);
   aMetaOptions.Keywords := ReadMetaOption(aIni, 'keywords', True);
   aMetaOptions.VideoId := ReadMetaOption(aIni, 'video_id', True);
+  aMetaOptions.TranscriptLanguage := ReadMetaOption(aIni, 'transcript_language', True);
   aMetaOptions.Uploader := ReadMetaOption(aIni, 'uploader', True);
   aMetaOptions.UploaderId := ReadMetaOption(aIni, 'uploader_id', True);
   aMetaOptions.ChannelId := ReadMetaOption(aIni, 'channel_id', True);
@@ -1205,6 +1210,8 @@ begin
     AppendMetaLine(aMetaOptions.Channel, 'channel', aMeta.Channel, lBuilder);
     AppendMetaLine(aMetaOptions.Created, 'created', aMeta.Created, lBuilder);
     AppendMetaLine(aMetaOptions.VideoId, 'video_id', aMeta.VideoId, lBuilder);
+    AppendMetaLine(aMetaOptions.TranscriptLanguage, 'transcript_language',
+      aMeta.TranscriptLanguage, lBuilder);
     AppendMetaLine(aMetaOptions.Uploader, 'uploader', aMeta.Uploader, lBuilder);
     AppendMetaLine(aMetaOptions.UploaderId, 'uploader_id', aMeta.UploaderId, lBuilder);
     AppendMetaLine(aMetaOptions.ChannelId, 'channel_id', aMeta.ChannelId, lBuilder);
@@ -5593,6 +5600,11 @@ begin
     ForgetSubtitleSource(lKey);
 
     Result.Meta := lSource.Meta;
+    // `de-orig` is still German; `no` is quoted by YamlScalar (YAML bool).
+    Result.Meta.TranscriptLanguage := lSource.Track.Language;
+    if Result.Meta.TranscriptLanguage.EndsWith('-orig', True) then
+      SetLength(Result.Meta.TranscriptLanguage,
+        Length(Result.Meta.TranscriptLanguage) - Length('-orig'));
     lFiles := TDirectory.GetFiles(lTempDir, '*.srt');
     if Length(lFiles) = 0 then
       raise EMissingTranscriptError.Create(CMissingSubtitleMessage, Result.Meta);
