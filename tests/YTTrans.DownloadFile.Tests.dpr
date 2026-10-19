@@ -15,6 +15,7 @@ uses
   MaxLogic.MadExcept.AiRunner in '..\..\MaxLogicFoundation\MaxLogic.MadExcept.AiRunner.pas',
   YTTrans.MadExcept.Tests in 'YTTrans.MadExcept.Tests.pas',
   YTTrans.ProcessRunner.Tests in 'YTTrans.ProcessRunner.Tests.pas',
+  YTTrans.Gui.Downloads.Tests in 'YTTrans.Gui.Downloads.Tests.pas',
   YTTrans.DownloadFile.Tests in 'YTTrans.DownloadFile.Tests.pas';
 
 var

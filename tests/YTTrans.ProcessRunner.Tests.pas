@@ -17,6 +17,8 @@ type
     [Test] procedure CapturesLargeStdoutAndTrailingStderr200Times;
     // a grandchild that outlives the child keeps the pipe write end open
     [Test] procedure ReturnsWhenGrandchildHoldsPipeAfterExit;
+    // YTD-039: the child runs inside the caller's job, grandchildren too
+    [Test] procedure TerminatingJobKillsChildAndGrandchild;
   end;
 
 implementation
@@ -24,7 +26,27 @@ implementation
 uses
   Winapi.Windows, System.SysUtils, System.IOUtils, System.Classes,
   System.Diagnostics,
-  YTTrans.ProcessRunner;
+  YTTrans.ProcessRunner, YTTrans.Gui.Downloads;
+
+type
+  // JOBOBJECT_BASIC_ACCOUNTING_INFORMATION; not declared in Winapi.Windows
+  TJobBasicAccounting = record
+    TotalUserTime, TotalKernelTime, ThisPeriodTotalUserTime,
+      ThisPeriodTotalKernelTime: Int64;
+    TotalPageFaultCount, TotalProcesses, ActiveProcesses,
+      TotalTerminatedProcesses: DWORD;
+  end;
+
+function JobActiveProcesses(aJob: THandle): DWORD;
+var
+  lInfo: TJobBasicAccounting;
+begin
+  lInfo := Default(TJobBasicAccounting);
+  if not QueryInformationJobObject(aJob, JobObjectBasicAccountingInformation,
+    @lInfo, SizeOf(lInfo), nil) then
+    RaiseLastOSError;
+  Result := lInfo.ActiveProcesses;
+end;
 
 function GetProcessHandleCount(hProcess: THandle;
   var pdwHandleCount: DWORD): BOOL; stdcall; external kernel32;
@@ -185,6 +207,64 @@ begin
     if lCallerWrite <> 0 then
       CloseHandle(lCallerWrite);
     CloseHandle(lCallerRead);
+  end;
+end;
+
+procedure TYTTransProcessRunnerTests.TerminatingJobKillsChildAndGrandchild;
+var
+  lJob: THandle;
+  lThread: TThread;
+  lExitCode: Integer;
+  lError: string;
+  lActiveBefore: DWORD;
+  lWatch: TStopwatch;
+  lWait: DWORD;
+begin
+  lJob := CreateKillOnCloseJob;
+  Assert.AreNotEqual(THandle(0), lJob, 'job creation');
+  try
+    lExitCode := -2;
+    lError := '';
+    // ping holds the stdout pipe; without the job it outlives cmd
+    lThread := TThread.CreateAnonymousThread(
+      procedure
+      var
+        lOut, lErr: string;
+      begin
+        try
+          lExitCode := RunConsoleProcess(SystemCmdExe,
+            '/d /c ping -n 30 127.0.0.1', lOut, lErr, lJob);
+        except
+          on E: Exception do
+            lError := E.ClassName + ': ' + E.Message;
+        end;
+      end);
+    lThread.FreeOnTerminate := False;
+    try
+      lThread.Start;
+      Sleep(1000);
+      lActiveBefore := JobActiveProcesses(lJob);
+      lWatch := TStopwatch.StartNew;
+      Win32Check(TerminateJobObject(lJob, 1));
+      lWait := WaitForSingleObject(lThread.Handle, 10000);
+      lWatch.Stop;
+      Assert.AreEqual(DWORD(WAIT_OBJECT_0), lWait, 'runner did not return');
+      Assert.IsTrue(lActiveBefore >= 2, Format(
+        'cmd and ping must run inside the job; active=%d', [lActiveBefore]));
+      Assert.IsTrue(lWatch.ElapsedMilliseconds < 3000, Format(
+        'returned after %d ms; a grandchild held the pipe',
+        [lWatch.ElapsedMilliseconds]));
+      Assert.AreEqual('', lError);
+      Assert.AreEqual(1, lExitCode);
+      Assert.AreEqual(DWORD(0), JobActiveProcesses(lJob));
+    finally
+      if WaitForSingleObject(lThread.Handle, 0) <> WAIT_OBJECT_0 then
+        TerminateJobObject(lJob, 1);
+      lThread.WaitFor;
+      lThread.Free;
+    end;
+  finally
+    CloseHandle(lJob);
   end;
 end;
 

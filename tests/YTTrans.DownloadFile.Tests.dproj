@@ -56,8 +56,11 @@
     <DCCReference Include="YTTrans.DownloadFile.Tests.pas"/>
     <DCCReference Include="YTTrans.MadExcept.Tests.pas"/>
     <DCCReference Include="YTTrans.ProcessRunner.Tests.pas"/>
+    <DCCReference Include="YTTrans.Gui.Downloads.Tests.pas"/>
     <DCCReference Include="..\src\YTTrans.ChannelIndex.pas"/>
     <DCCReference Include="..\src\YTTrans.ProcessRunner.pas"/>
+    <DCCReference Include="..\src\YTTrans.FrontMatter.pas"/>
+    <DCCReference Include="..\src\YTTrans.Gui.Downloads.pas"/>
     <DCCReference Include="..\src\YTTrans.MadExcept.pas"/>
     <DCCReference Include="..\..\MaxLogicFoundation\MaxLogic.MadExcept.AiRunner.pas"/>
     <BuildConfiguration Include="Release">

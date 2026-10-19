@@ -18,8 +18,11 @@ const
 // grandchild still holds a pipe CPipeGraceMs after the exit, reading stops and
 // CPipeHeldNote is appended to aStdErr.
 // Raises EOSError when the process cannot be started; no handles leak.
+// When aJob <> 0 the child is assigned to that job object before it runs, so
+// its own children inherit the job; a failed assignment kills the child and
+// raises EOSError.
 function RunConsoleProcess(const aExePath, aArguments: string;
-  out aStdOut, aStdErr: string): Integer;
+  out aStdOut, aStdErr: string; aJob: THandle = 0): Integer;
 
 implementation
 
@@ -129,7 +132,7 @@ begin
 end;
 
 function RunConsoleProcess(const aExePath, aArguments: string;
-  out aStdOut, aStdErr: string): Integer;
+  out aStdOut, aStdErr: string; aJob: THandle = 0): Integer;
 var
   lSecurity: TSecurityAttributes;
   lOutRead, lOutWrite, lErrRead, lErrWrite, lNul, lProcess: THandle;
@@ -142,7 +145,7 @@ var
   lOutReader, lErrReader: TPipeReader;
   lReaders: array[0..1] of THandle;
   lPipeHeld: Boolean;
-  lExitCode: DWORD;
+  lExitCode, lCreationFlags, lJobError: DWORD;
 begin
   aStdOut := '';
   aStdErr := '';
@@ -202,8 +205,11 @@ begin
           nil, PNativeUInt(nil)^) then // lpReturnSize is reserved: NULL
           RaiseLastOSError;
         lStartup.lpAttributeList := lAttributes;
+        lCreationFlags := NORMAL_PRIORITY_CLASS or EXTENDED_STARTUPINFO_PRESENT;
+        if aJob <> 0 then
+          lCreationFlags := lCreationFlags or CREATE_SUSPENDED;
         if not CreateProcess(PChar(aExePath), PChar(lCmd), nil, nil, True,
-          NORMAL_PRIORITY_CLASS or EXTENDED_STARTUPINFO_PRESENT, nil,
+          lCreationFlags, nil,
           Pointer(lWorkDir), lStartup.StartupInfo, lInfo) then
           RaiseLastOSError;
       finally
@@ -213,6 +219,18 @@ begin
       FreeMem(lAttributes);
     end;
     lProcess := lInfo.hProcess;
+    if aJob <> 0 then
+    begin
+      // assign before the first instruction runs, so no grandchild escapes
+      if (not AssignProcessToJobObject(aJob, lProcess)) or
+        (ResumeThread(lInfo.hThread) = DWORD(-1)) then
+      begin
+        lJobError := GetLastError;
+        TerminateProcess(lProcess, 1);
+        CloseHandle(lInfo.hThread);
+        RaiseLastOSError(lJobError); // the finally block releases the rest
+      end;
+    end;
     CloseHandle(lInfo.hThread);
 
     // the child owns its copies now; ours would keep the pipes open forever

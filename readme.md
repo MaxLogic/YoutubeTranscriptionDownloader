@@ -116,6 +116,15 @@ Command-line Delphi builds must run `madExceptPatch` after compilation so madExc
 3.  Place both `yttrans.exe` and `yt-dlp.exe` in the same folder.
 4.  (Optional) For easy access from anywhere, add this folder to your system's `PATH` environment variable.
 
+## Desktop GUI (yttransgui)
+
+`yttransgui.exe` is a small Windows window for fetching single-video transcripts. Build `src\yttransgui.dproj`; the exe lands next to `yttrans.exe`, which it needs in the same folder.
+
+- Paste a video URL and press Enter (or click **Download**). Several URLs can be submitted; two download at a time, one until the first download of the session has finished.
+- The list shows each entry as `[queued]`, `[downloading]`, `[done] <title>`, or `[failed] <url>`. Select an entry to see its transcript (with front matter) or the yttrans error text. Submitting a failed URL again retries it.
+- Each download runs `yttrans.exe "<url>" -o "<file>" -meta`, so `settings.ini` next to `yttrans.exe` (cookies, `[meta]` switches) applies; `output_dir` and `prefix` do not.
+- Transcripts go to a per-session folder `%TEMP%\yttransgui-<guid>` that is deleted when the window closes. Closing also stops running downloads. Copy anything you want to keep before closing.
+
 ## Usage
 
 The basic command structure is:

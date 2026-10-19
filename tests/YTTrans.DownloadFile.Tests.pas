@@ -129,6 +129,7 @@ uses
   YTTrans.DownloadFile,
   YTTrans.Throttle,
   YTTransApp,
+  YTTrans.FrontMatter,
   VSoft.YAML;
 
 function LoadFixture(const aName: string): string;

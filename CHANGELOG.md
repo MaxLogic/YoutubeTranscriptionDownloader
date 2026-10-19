@@ -5,6 +5,7 @@ All notable changes to this project are documented in this file.
 ## [Unreleased]
 
 ### Added
+- `yttransgui.exe`, a small VCL window for single-video transcripts: URL edit with Enter to download, a status list that shows the video title when done, and a transcript viewer. It runs `yttrans.exe` per URL (two at a time) in a job object and keeps transcripts in a per-session `%TEMP%` folder that is deleted on close.
 - Channel mode (`-c/--channel`) to download transcripts for all videos from the seed video's channel.
 - Channel options: `-j/--jobs`, `-ov/--override`, `-co/--channel-output`, `-is/--include-shorts`, `-il/--include-live`.
 - Authentication options for yt-dlp channel/video requests: `--cookies` and `--cookies-from-browser`.
