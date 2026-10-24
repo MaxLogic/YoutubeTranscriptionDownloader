@@ -43,6 +43,18 @@ type
     [Test] procedure ChannelIndexRoundTripsAndDeduplicates;
     [Test] procedure ChannelIndexRetainsLastGoodCopy;
     [Test] procedure FreshDiscoveryUsesRssAndPreservesHistory;
+    [Test]
+    [TestCase('Prefixless', '0a_pO439rhcyHBZq3AKdrw')]
+    [TestCase('Canonical', 'UC0a_pO439rhcyHBZq3AKdrw')]
+    procedure RssChannelIdentityAcceptsLiveFeed(const aFeedId: string);
+    [Test]
+    [TestCase('Missing', 'missing')]
+    [TestCase('Empty', 'empty')]
+    [TestCase('DifferentPrefixless', '0a_pO439rhcyHBZq3AKdrX')]
+    [TestCase('DifferentCanonical', 'UC0a_pO439rhcyHBZq3AKdrX')]
+    [TestCase('DifferentCase', '0a_pO439rhcyHBZq3AKDRW')]
+    [TestCase('DoublePrefix', 'UCUC0a_pO439rhcyHBZq3AKdrw')]
+    procedure RssChannelIdentityRejectsWithoutChangingStore(const aFeedId: string);
     [Test] procedure RssThrottleUsesSharedController;
     [Test] procedure RecoveryModesAvoidFreshDiscovery;
     [Test] procedure AllModeForcesSafeFullReconciliation;
@@ -1274,6 +1286,121 @@ begin
       Assert.AreEqual(croWarning, Outcome);
       Assert.AreEqual(BeforeMalformed,
         TFile.ReadAllText(Store.FileName, TEncoding.UTF8));
+    finally
+      Controller.Free;
+      Store.Free;
+    end;
+  finally
+    TDirectory.Delete(Dir, True);
+  end;
+end;
+
+procedure TDownloadFileTests.RssChannelIdentityAcceptsLiveFeed(
+  const aFeedId: string);
+var
+  Dir, ErrorMessage, Body: string;
+  Store: TChannelIndexStore;
+  Current, Updated: TChannelIndexData;
+  Controller: TThrottleController;
+  NowUtc: TDateTime;
+begin
+  Dir := TPath.Combine(TPath.GetTempPath, TPath.GetGUIDFileName);
+  TDirectory.CreateDirectory(Dir);
+  try
+    Store := TChannelIndexStore.Create(Dir);
+    Controller := TThrottleController.Create(0, 0);
+    try
+      Current := SampleChannelIndex;
+      Current.ChannelId := 'UC0a_pO439rhcyHBZq3AKdrw';
+      Store.Save(Current);
+      Body := StringReplace(LoadFixture('youtube-rss-prefixless-live.xml'),
+        '<yt:channelId>0a_pO439rhcyHBZq3AKdrw</yt:channelId>',
+        '<yt:channelId>' + aFeedId + '</yt:channelId>', []);
+      NowUtc := EncodeDateTime(2030, 1, 10, 0, 0, 0, 0);
+      Assert.AreEqual(croSuccess, RefreshChannelIndexFromRss(
+        Store, Current, Controller,
+        procedure(const aUrl: string; out aStatusCode: Integer;
+          out aBody, aError: string)
+        begin
+          Assert.AreEqual('https://www.youtube.com/feeds/videos.xml?channel_id=' +
+            Current.ChannelId, aUrl);
+          aStatusCode := 200;
+          aBody := Body;
+          aError := '';
+        end,
+        nil, NowUtc, Updated, ErrorMessage), ErrorMessage);
+      Assert.AreEqual('', ErrorMessage);
+      Assert.AreEqual(Current.ChannelId, Updated.ChannelId,
+        'The saved identity must remain canonical');
+      Assert.AreEqual(16, Length(Updated.Videos));
+      Assert.AreEqual('SbMpkJdZB8g', Updated.Videos[1].VideoId);
+      Assert.AreEqual('abcDEF12345',
+        Updated.Videos[0].VideoId,
+        'The live feed must not replace historical entries');
+      Assert.AreEqual(Current.LastFullScanUtc, Updated.LastFullScanUtc,
+        1 / MSecsPerDay);
+      Assert.AreEqual(NowUtc, Updated.LastIncrementalScanUtc, 1 / MSecsPerDay);
+    finally
+      Controller.Free;
+      Store.Free;
+    end;
+  finally
+    TDirectory.Delete(Dir, True);
+  end;
+end;
+
+procedure TDownloadFileTests.RssChannelIdentityRejectsWithoutChangingStore(
+  const aFeedId: string);
+var
+  Dir, ErrorMessage, Body, Replacement, BeforePrimary, BeforeBackup: string;
+  Store: TChannelIndexStore;
+  Current, Updated, Loaded: TChannelIndexData;
+  Controller: TThrottleController;
+begin
+  Dir := TPath.Combine(TPath.GetTempPath, TPath.GetGUIDFileName);
+  TDirectory.CreateDirectory(Dir);
+  try
+    Store := TChannelIndexStore.Create(Dir);
+    Controller := TThrottleController.Create(0, 0);
+    try
+      Current := SampleChannelIndex;
+      Current.ChannelId := 'UC0a_pO439rhcyHBZq3AKdrw';
+      Store.Save(Current);
+      Store.Save(Current);
+      BeforePrimary := TFile.ReadAllText(Store.FileName, TEncoding.UTF8);
+      BeforeBackup := TFile.ReadAllText(Store.BackupFileName, TEncoding.UTF8);
+      Replacement := '<yt:channelId>' + aFeedId + '</yt:channelId>';
+      if aFeedId = 'missing' then
+        Replacement := ''
+      else if aFeedId = 'empty' then
+        Replacement := '<yt:channelId></yt:channelId>';
+      Body := StringReplace(LoadFixture('youtube-rss-prefixless-live.xml'),
+        '<yt:channelId>0a_pO439rhcyHBZq3AKdrw</yt:channelId>', Replacement, []);
+      Assert.AreEqual(croWarning, RefreshChannelIndexFromRss(
+        Store, Current, Controller,
+        procedure(const aUrl: string; out aStatusCode: Integer;
+          out aBody, aError: string)
+        begin
+          aStatusCode := 200;
+          aBody := Body;
+          aError := '';
+        end,
+        nil, EncodeDateTime(2030, 1, 10, 0, 0, 0, 0), Updated, ErrorMessage));
+      Assert.AreEqual('YouTube RSS channel identity is missing or mismatched',
+        ErrorMessage);
+      Assert.AreEqual(Current.ChannelId, Updated.ChannelId);
+      Assert.AreEqual(Current.LastIncrementalScanUtc,
+        Updated.LastIncrementalScanUtc, 1 / MSecsPerDay);
+      Assert.AreEqual(1, Length(Updated.Videos));
+      Assert.AreEqual('abcDEF12345', Updated.Videos[0].VideoId);
+      Assert.AreEqual(BeforePrimary,
+        TFile.ReadAllText(Store.FileName, TEncoding.UTF8));
+      Assert.AreEqual(BeforeBackup,
+        TFile.ReadAllText(Store.BackupFileName, TEncoding.UTF8));
+      Assert.IsTrue(Store.Load(Loaded));
+      Assert.AreEqual(Current.ChannelId, Loaded.ChannelId);
+      Assert.AreEqual(1, Length(Loaded.Videos));
+      Assert.AreEqual('abcDEF12345', Loaded.Videos[0].VideoId);
     finally
       Controller.Free;
       Store.Free;

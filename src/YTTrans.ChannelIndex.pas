@@ -152,7 +152,11 @@ begin
   if not Assigned(lFeed) or not NodeHasName(lFeed, 'feed') then
     raise EChannelIndexError.Create('YouTube RSS has no feed element');
   lChannelId := ChildText(lFeed, 'channelId');
-  if (lChannelId = '') or not SameText(lChannelId, aExpectedChannelId) then
+  // YouTube RSS may omit UC from the feed-level channel ID.
+  if (lChannelId = '') or
+     not (SameText(lChannelId, aExpectedChannelId) or
+       (aExpectedChannelId.StartsWith('UC') and
+        (lChannelId = Copy(aExpectedChannelId, 3, MaxInt)))) then
     raise EChannelIndexError.Create('YouTube RSS channel identity is missing or mismatched');
 
   lVideos := TList<TChannelIndexVideo>.Create;
