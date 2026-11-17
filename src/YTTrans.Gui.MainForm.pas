@@ -17,15 +17,25 @@ type
     LabelUrl: TStaticText;
     ButtonDownload: TButton;
     EditUrl: TEdit;
+    PanelItems: TPanel;
     ListBoxItems: TListBox;
+    LabelItems: TStaticText;
+    PanelTranscript: TPanel;
+    LabelTranscript: TStaticText;
     SplitterMain: TSplitter;
     MemoTranscript: TMemo;
     procedure FormCreate(Sender: TObject);
     procedure FormClose(Sender: TObject; var Action: TCloseAction);
     procedure ButtonDownloadClick(Sender: TObject);
     procedure ListBoxItemsClick(Sender: TObject);
+    procedure ListBoxItemsKeyDown(Sender: TObject; var Key: Word;
+      Shift: TShiftState);
+    procedure MemoTranscriptKeyDown(Sender: TObject; var Key: Word;
+      Shift: TShiftState);
   private
     FItems: TObjectList<TDownloadItem>;
+    FRemovedItems: TObjectList<TDownloadItem>;
+    FNextItemId: Integer;
     FThreads: TList<TDownloadThread>; // started and not yet finished
     FSessionDir, FExePath: string;
     FJob: THandle;
@@ -60,6 +70,7 @@ const
 procedure TMainForm.FormCreate(Sender: TObject);
 begin
   FItems := TObjectList<TDownloadItem>.Create(True);
+  FRemovedItems := TObjectList<TDownloadItem>.Create(True);
   FThreads := TList<TDownloadThread>.Create;
   FExePath := TPath.Combine(ExtractFilePath(ParamStr(0)), 'yttrans.exe');
   FSessionDir := TPath.Combine(TPath.GetTempPath, CSessionFolderPrefix +
@@ -73,6 +84,7 @@ destructor TMainForm.Destroy;
 begin
   FThreads.Free;
   FItems.Free;
+  FRemovedItems.Free;
   inherited;
 end;
 
@@ -130,8 +142,9 @@ begin
   begin
     lItem := TDownloadItem.Create;
     lItem.Url := lUrl;
+    Inc(FNextItemId);
     lItem.TranscriptPath := TPath.Combine(FSessionDir,
-      IntToStr(FItems.Count + 1) + '.md');
+      IntToStr(FNextItemId) + '.md');
     lItem.Status := dsQueued;
     lIndex := FItems.Add(lItem);
     ListBoxItems.Items.Add(DownloadDisplayText(lItem));
@@ -146,6 +159,41 @@ end;
 procedure TMainForm.ListBoxItemsClick(Sender: TObject);
 begin
   ShowItem(ListBoxItems.ItemIndex);
+end;
+
+procedure TMainForm.ListBoxItemsKeyDown(Sender: TObject; var Key: Word;
+  Shift: TShiftState);
+var
+  lIndex: Integer;
+  lItem: TDownloadItem;
+begin
+  if (Key <> VK_DELETE) or (Shift <> []) then
+    Exit;
+  Key := 0;
+  lIndex := ListBoxItems.ItemIndex;
+  if (lIndex < 0) or (lIndex >= FItems.Count) then
+    Exit;
+  lItem := FItems[lIndex];
+  // A running thread retains this item until its completion callback.
+  if lItem.Status = dsDownloading then
+    FRemovedItems.Add(FItems.Extract(lItem))
+  else
+    FItems.Delete(lIndex);
+  ListBoxItems.Items.Delete(lIndex);
+  if lIndex >= FItems.Count then
+    lIndex := FItems.Count - 1;
+  ListBoxItems.ItemIndex := lIndex;
+  ShowItem(lIndex);
+end;
+
+procedure TMainForm.MemoTranscriptKeyDown(Sender: TObject; var Key: Word;
+  Shift: TShiftState);
+begin
+  if (Key = Ord('A')) and (Shift = [ssCtrl]) then
+  begin
+    MemoTranscript.SelectAll;
+    Key := 0;
+  end;
 end;
 
 procedure TMainForm.StartQueued;
@@ -197,6 +245,14 @@ begin
   lThread := Sender as TDownloadThread;
   FThreads.Remove(lThread);
   Dec(FRunning);
+  lItem := lThread.Item;
+  if FRemovedItems.Contains(lItem) then
+  begin
+    FRemovedItems.Remove(lItem);
+    FFirstDone := True;
+    StartQueued;
+    Exit;
+  end;
   if FClosing then
     Exit;
   lItem := lThread.Item;

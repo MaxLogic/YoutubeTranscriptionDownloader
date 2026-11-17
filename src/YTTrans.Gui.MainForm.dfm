@@ -80,26 +80,76 @@ object MainForm: TMainForm
       TabStop = False
     end
   end
-  object ListBoxItems: TListBox
+  object PanelItems: TPanel
     Left = 0
     Top = 40
     Width = 320
     Height = 481
     Align = alLeft
-    IntegralHeight = False
-    ItemHeight = 15
+    BevelOuter = bvNone
+    ShowCaption = False
     TabOrder = 1
-    OnClick = ListBoxItemsClick
+    object ListBoxItems: TListBox
+      Left = 0
+      Top = 23
+      Width = 320
+      Height = 458
+      Align = alClient
+      IntegralHeight = False
+      ItemHeight = 15
+      TabOrder = 0
+      OnClick = ListBoxItemsClick
+      OnKeyDown = ListBoxItemsKeyDown
+    end
+    object LabelItems: TStaticText
+      AlignWithMargins = True
+      Left = 8
+      Top = 3
+      Width = 304
+      Height = 17
+      Margins.Left = 8
+      Margins.Right = 8
+      Align = alTop
+      AutoSize = False
+      Caption = '&List of downloads'
+      FocusControl = ListBoxItems
+      TabStop = False
+    end
   end
-  object MemoTranscript: TMemo
+  object PanelTranscript: TPanel
     Left = 325
     Top = 40
     Width = 559
     Height = 481
     Align = alClient
-    ReadOnly = True
-    ScrollBars = ssBoth
+    BevelOuter = bvNone
+    ShowCaption = False
     TabOrder = 2
-    WordWrap = False
+    object MemoTranscript: TMemo
+      Left = 0
+      Top = 23
+      Width = 559
+      Height = 458
+      Align = alClient
+      ReadOnly = True
+      ScrollBars = ssBoth
+      TabOrder = 0
+      WordWrap = False
+      OnKeyDown = MemoTranscriptKeyDown
+    end
+    object LabelTranscript: TStaticText
+      AlignWithMargins = True
+      Left = 8
+      Top = 3
+      Width = 543
+      Height = 17
+      Margins.Left = 8
+      Margins.Right = 8
+      Align = alTop
+      AutoSize = False
+      Caption = '&Memo transcript'
+      FocusControl = MemoTranscript
+      TabStop = False
+    end
   end
 end
